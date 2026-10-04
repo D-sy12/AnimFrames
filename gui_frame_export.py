@@ -5,19 +5,18 @@
 布局（左右固定 13:8）：
   左侧：PS 式工作台画布（棋盘格透明底），实时合成显示所有"睁眼"图层，
         也可切换为精灵图拼接预览。
-  右侧上半：导出参数（精灵图 PNG 排列/分辨率 + PSD 画布/统一缩放 +
-        两个导出按钮）。
+  右侧上半：画布与工具（移动/缩放/框选、视图缩放、画布/图像大小、
+        导入图片）+ 精灵图 PNG 参数（行数、间距、导出）。
   右侧下半：所有图片按一列排列，每行 = 小眼睛(是否在工作台显示/参与
         导出) + 缩略图 + 名称尺寸 + 该图层独立缩放%。
 
 功能：
-  1. 动画精灵图：可见帧拼一张透明底 PNG，自动/手动列数、间距、
-     10-400% 分辨率缩放。
-  2. PSD 分层图：每张图片一个图层，逐图层 5-400% 独立缩放；隐藏图层
-     在 PSD 中为隐藏状态（不进合并预览），PS / Krita / Photopea 可打开。
+  动画精灵图：可见帧拼一张透明底 PNG，自动/按目标行数排列、间距、
+  每张图片独立缩放（真实重采样进入导出）。支持 PS 式画布大小 /
+  图像大小对话框、框选多图层整组移动缩放、每图独立撤销（Ctrl+Z）。
 
 图片来源优先级：色调统一 colored/ → 精抠 refined/ → 批量抠图 matted/。
-产物目录：frames_dir/export/（sprite_sheet.png / layers.psd）。
+产物目录：frames_dir/export/（sprite_sheet.png）。
 """
 
 import os
@@ -32,9 +31,11 @@ import cv2
 from PySide6.QtCore import Qt, QTimer, Signal, QThread, QRectF
 from PySide6.QtGui import QKeySequence, QShortcut, QPixmap, QPainter, QColor
 from PySide6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QSlider,
-    QScrollArea, QGroupBox, QCheckBox, QSpinBox, QToolButton,
-    QFrame, QMessageBox, QFileDialog,
+    QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel,
+    QPushButton, QScrollArea, QGroupBox, QCheckBox, QSpinBox,
+    QToolButton, QFrame, QMessageBox, QFileDialog, QDialog,
+    QDialogButtonBox, QComboBox, QDoubleSpinBox, QButtonGroup,
+    QRadioButton,
 )
 
 import export_utils as eu
@@ -51,6 +52,8 @@ class WorkspaceCanvas(FitImageLabel):
     drag_delta = Signal(float, float)   # (dx, dy) 全分辨率画布像素
     drag_finished = Signal()
     resized = Signal()
+    marquee_changed = Signal(QRectF, bool)  # 画布坐标矩形, 进行中
+    marquee_done = Signal(QRectF, bool)     # 框选结束, additive=Shift
 
     def __init__(self, checker: bool = True):
         super().__init__(checker)
@@ -73,12 +76,17 @@ class WorkspaceCanvas(FitImageLabel):
         self._pan_y = 0.0
         self._pan_last = None
         self.zoom_changed = None         # 由页面赋值为回调(percent:int)
+        # 框选：marquee 工具下的屏幕坐标起止点
+        self._marquee_start = None
+        self._marquee_cur = None
         self.setCursor(Qt.OpenHandCursor)
 
     def set_tool(self, tool: str):
         self.tool = tool
-        self.setCursor(Qt.OpenHandCursor if tool == "move"
-                       else Qt.SizeAllCursor)
+        self.setCursor(
+            Qt.OpenHandCursor if tool == "move"
+            else Qt.SizeAllCursor if tool == "scale"
+            else Qt.CrossCursor)         # marquee
 
     def set_image(self, pix):
         """普通（精灵图预览）模式：退出分层模式，并复位视图缩放"""
@@ -210,6 +218,20 @@ class WorkspaceCanvas(FitImageLabel):
                 self._layer_sel, QRectF(0, 0, sw, sh))
         if self._layer_above is not None:
             p.drawPixmap(rect, self._layer_above, full)
+        # 框选橡皮筋（屏幕坐标，半透明填充+白虚线）
+        if self._marquee_start is not None and self._marquee_cur is not None:
+            from PySide6.QtGui import QPen
+            from PySide6.QtCore import QPointF as _PF
+            s, c = self._marquee_start, self._marquee_cur
+            band = QRectF(_PF(min(s.x(), c.x()), min(s.y(), c.y())),
+                          _PF(max(s.x(), c.x()), max(s.y(), c.y())))
+            p.setClipping(False)
+            p.fillRect(band, QColor(80, 160, 255, 50))
+            pen = QPen(QColor("#ffffff"))
+            pen.setStyle(Qt.DashLine)
+            pen.setWidth(1)
+            p.setPen(pen)
+            p.drawRect(band)
         p.end()
 
     def _render(self):
@@ -222,15 +244,30 @@ class WorkspaceCanvas(FitImageLabel):
         self._rect_key = None
         self.update()
 
+    def _screen_to_canvas_rect(self, p0, p1) -> QRectF:
+        """屏幕矩形（两个任意角点）→ 预览画布坐标矩形"""
+        x, y, dw, dh = self._disp_rect
+        pw, ph = self._pix.width(), self._pix.height()
+        x0 = (min(p0.x(), p1.x()) - x) * pw / dw
+        x1 = (max(p0.x(), p1.x()) - x) * pw / dw
+        y0 = (min(p0.y(), p1.y()) - y) * ph / dh
+        y1 = (max(p0.y(), p1.y()) - y) * ph / dh
+        return QRectF(x0, y0, x1 - x0, y1 - y0)
+
     def mousePressEvent(self, e):
         if e.button() == Qt.MiddleButton and self._disp_rect:
             self._pan_last = e.position()
             self.setCursor(Qt.ClosedHandCursor)
         elif e.button() == Qt.LeftButton and self._disp_rect:
-            self._last = e.position()
-            self.setCursor(Qt.ClosedHandCursor if self.tool == "move"
-                           else Qt.SizeAllCursor)
-            self.drag_started.emit()
+            if self.tool == "marquee":
+                self._marquee_start = e.position()
+                self._marquee_cur = e.position()
+                self.update()
+            else:
+                self._last = e.position()
+                self.setCursor(Qt.ClosedHandCursor
+                               if self.tool == "move" else Qt.SizeAllCursor)
+                self.drag_started.emit()
         super().mousePressEvent(e)
 
     def mouseMoveEvent(self, e):
@@ -241,6 +278,13 @@ class WorkspaceCanvas(FitImageLabel):
             self._pan_last = pos
             self._rect_key = None
             self.update()
+        elif self._marquee_start is not None:
+            self._marquee_cur = e.position()
+            self.update()
+            self.marquee_changed.emit(
+                self._screen_to_canvas_rect(self._marquee_start,
+                                            self._marquee_cur),
+                bool(e.modifiers() & Qt.ShiftModifier))
         elif self._last is not None and self._disp_rect:
             pos = e.position()
             dx, dy = pos.x() - self._last.x(), pos.y() - self._last.y()
@@ -255,6 +299,14 @@ class WorkspaceCanvas(FitImageLabel):
         if e.button() == Qt.MiddleButton and self._pan_last is not None:
             self._pan_last = None
             self.set_tool(self.tool)
+        elif self._marquee_start is not None and e.button() == Qt.LeftButton:
+            rect = self._screen_to_canvas_rect(self._marquee_start,
+                                               e.position())
+            self._marquee_start = None
+            self._marquee_cur = None
+            self.update()
+            self.marquee_done.emit(
+                rect, bool(e.modifiers() & Qt.ShiftModifier))
         elif self._last is not None:
             self._last = None
             self.set_tool(self.tool)
@@ -286,10 +338,7 @@ class _ExportWorker(QThread):
 
     def run(self):
         try:
-            if self.mode == "sprite":
-                self._run_sprite()
-            else:
-                self._run_psd()
+            self._run_sprite()
         except Exception as e:
             self.failed.emit(str(e))
 
@@ -309,12 +358,16 @@ class _ExportWorker(QThread):
             raise ValueError("没有可见图片（全部被小眼睛隐藏）")
         images = []
         for i, it in enumerate(items, 1):
-            images.append(self._load(it))
+            img = self._load(it)
+            # 单张图片缩放（layer_scales）生效：按各自图层缩放重采样
+            layer_scale = p["layer_scales"].get(it["key"], 100) / 100.0
+            img = eu.scale_bgra(img, layer_scale)
+            images.append(img)
             self.progress.emit(f"读取图片 {i}/{len(items)}")
         self.progress.emit("正在拼接精灵图…")
         canvas, _ = eu.build_sprite_sheet(
-            images, columns=0 if p["auto_columns"] else p["columns"],
-            scale=p["sprite_scale"] / 100.0, padding=p["padding"])
+            images, columns=p["columns"],
+            scale=1.0, padding=p["padding"])
         os.makedirs(os.path.dirname(self.out_path), exist_ok=True)
         if not imwrite_unicode(self.out_path, canvas):
             raise IOError(f"写入失败：{self.out_path}")
@@ -322,35 +375,6 @@ class _ExportWorker(QThread):
             f"精灵图已导出：{os.path.basename(self.out_path)} "
             f"{canvas.shape[1]}×{canvas.shape[0]}（{len(items)} 帧）")
         self.finished_ok.emit("sprite", self.out_path)
-
-    def _run_psd(self):
-        p = self.params
-        cw, ch = p["canvas_wh"]
-        layers = []
-        composite = np.zeros((ch, cw, 4), np.uint8)
-        for i, it in enumerate(self.items, 1):
-            img = self._load(it)
-            pct = p["layer_scales"].get(it["key"], 100)
-            sim = eu.scale_bgra(img, pct / 100.0)
-            x, y = eu.centered_xy(cw, ch, sim.shape[1], sim.shape[0])
-            ox, oy = p["layer_offsets"].get(it["key"], (0.0, 0.0))
-            x += int(round(ox))
-            y += int(round(oy))
-            name = os.path.splitext(it["key"])[0][:80]
-            vis = self._visible(it)
-            layers.append((name, sim, x, y, vis))
-            if vis:
-                eu.flatten_over(composite, sim, x, y)
-            self.progress.emit(f"准备图层 {i}/{len(self.items)}")
-        self.progress.emit("正在写入 PSD（PackBits 压缩）…")
-        os.makedirs(os.path.dirname(self.out_path), exist_ok=True)
-        eu.write_layered_psd(self.out_path, cw, ch, layers, composite)
-        hidden = sum(1 for l in layers if not l[4])
-        extra = f"，其中 {hidden} 个隐藏" if hidden else ""
-        self.progress.emit(
-            f"PSD 已导出：{os.path.basename(self.out_path)} "
-            f"{cw}×{ch}，{len(layers)} 个图层{extra}")
-        self.finished_ok.emit("psd", self.out_path)
 
 
 class _PreviewLoader(QThread):
@@ -384,6 +408,217 @@ class _PreviewLoader(QThread):
         self.done.emit()
 
 
+# ===================== PS 风格「画布大小 / 图像大小」对话框 =====================
+
+class CanvasSizeDialog(QDialog):
+    """仿 PS「画布大小」：当前/新建宽高 + 相对 + 九宫格定位 + 扩展颜色"""
+
+    def __init__(self, parent, cur_w: int, cur_h: int,
+                 new_w: int, new_h: int, anchor: Tuple[int, int] = (1, 1),
+                 ext_color: str = "透明"):
+        super().__init__(parent)
+        self.setWindowTitle("画布大小")
+        self.setModal(True)
+        self.setMinimumWidth(360)
+        lay = QVBoxLayout(self)
+        lay.setSpacing(8)
+
+        # 当前大小（只读）
+        cur_box = QGroupBox("当前大小")
+        cf = QGridLayout(cur_box)
+        cf.addWidget(QLabel("宽度："), 0, 0)
+        cf.addWidget(QLabel(f"{cur_w} 像素"), 0, 1)
+        cf.addWidget(QLabel("高度："), 1, 0)
+        cf.addWidget(QLabel(f"{cur_h} 像素"), 1, 1)
+        lay.addWidget(cur_box)
+
+        # 新建大小
+        new_box = QGroupBox("新建大小")
+        nf = QGridLayout(new_box)
+        nf.addWidget(QLabel("宽度(W)："), 0, 0)
+        self.spn_w = QSpinBox()
+        self.spn_w.setRange(1, 16384)
+        self.spn_w.setValue(new_w)
+        self.spn_w.setSuffix(" 像素")
+        nf.addWidget(self.spn_w, 0, 1)
+        nf.addWidget(QLabel("高度(H)："), 1, 0)
+        self.spn_h = QSpinBox()
+        self.spn_h.setRange(1, 16384)
+        self.spn_h.setValue(new_h)
+        self.spn_h.setSuffix(" 像素")
+        nf.addWidget(self.spn_h, 1, 1)
+        self.chk_relative = QCheckBox("相对(R)")
+        self.chk_relative.setToolTip(
+            "勾选后按相对增量调整（如 +100 / -50 像素）")
+        nf.addWidget(self.chk_relative, 2, 0, 1, 2)
+        self._base_w, self._base_h = new_w, new_h
+        self.chk_relative.toggled.connect(self._on_relative)
+        lay.addWidget(new_box)
+
+        # 定位（九宫格锚点）
+        anchor_box = QGroupBox("定位")
+        af = QGridLayout(anchor_box)
+        self.anchor_btns: List[List[QToolButton]] = []
+        self._anchor = list(anchor)          # (row, col) 0..2
+        arrows = [["↖", "↑", "↗"], ["←", "·", "→"], ["↙", "↓", "↘"]]
+        for r in range(3):
+            row = []
+            for c in range(3):
+                b = QToolButton()
+                b.setText(arrows[r][c])
+                b.setCheckable(True)
+                b.setFixedSize(26, 26)
+                b.clicked.connect(
+                    lambda _=False, rr=r, cc=c: self._set_anchor(rr, cc))
+                af.addWidget(b, r, c)
+                row.append(b)
+            self.anchor_btns.append(row)
+        self._refresh_anchor()
+        lay.addWidget(anchor_box)
+
+        # 画布扩展颜色
+        rowc = QHBoxLayout()
+        rowc.addWidget(QLabel("画布扩展颜色："))
+        self.cmb_color = QComboBox()
+        self.cmb_color.addItems(["透明", "白色", "黑色"])
+        self.cmb_color.setCurrentText(ext_color)
+        rowc.addWidget(self.cmb_color, 1)
+        lay.addLayout(rowc)
+
+        btns = QDialogButtonBox(QDialogButtonBox.Ok
+                                | QDialogButtonBox.Cancel)
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        lay.addWidget(btns)
+
+    def _on_relative(self, on: bool):
+        if on:
+            self._base_w, self._base_h = self.spn_w.value(), \
+                self.spn_h.value()
+            # 相对模式允许 0 和负增量
+            self.spn_w.setRange(-16384, 16384)
+            self.spn_h.setRange(-16384, 16384)
+            self.spn_w.setValue(0)
+            self.spn_h.setValue(0)
+        else:
+            # 先按增量算出目标绝对值（此时仍是宽范围，可承载负增量）
+            tw = max(1, self._base_w + self.spn_w.value())
+            th = max(1, self._base_h + self.spn_h.value())
+            self.spn_w.setRange(1, 16384)
+            self.spn_h.setRange(1, 16384)
+            self.spn_w.setValue(tw)
+            self.spn_h.setValue(th)
+
+    def _set_anchor(self, r: int, c: int):
+        self._anchor = [r, c]
+        self._refresh_anchor()
+
+    def _refresh_anchor(self):
+        for r in range(3):
+            for c in range(3):
+                self.anchor_btns[r][c].setChecked(
+                    [r, c] == self._anchor)
+
+    def result_values(self):
+        w, h = self.spn_w.value(), self.spn_h.value()
+        if self.chk_relative.isChecked():
+            w = self._base_w + w
+            h = self._base_h + h
+        return (max(1, min(16384, w)), max(1, min(16384, h)),
+                tuple(self._anchor), self.cmb_color.currentText())
+
+
+class ImageSizeDialog(QDialog):
+    """仿 PS「图像大小」：像素尺寸/百分比，联动整幅画布+所有图层"""
+
+    def __init__(self, parent, cur_w: int, cur_h: int, pct: int = 100):
+        super().__init__(parent)
+        self.setWindowTitle("图像大小")
+        self.setModal(True)
+        self.setMinimumWidth(340)
+        lay = QVBoxLayout(self)
+        lay.setSpacing(8)
+
+        size_box = QGroupBox("像素尺寸")
+        sf = QGridLayout(size_box)
+        sf.addWidget(QLabel(f"当前：{cur_w} × {cur_h} 像素"), 0, 0, 1, 4)
+        sf.addWidget(QLabel("宽度(W)："), 1, 0)
+        self.spn_w = QSpinBox()
+        self.spn_w.setRange(1, 16384)
+        self.spn_w.setValue(cur_w)
+        self.spn_w.setSuffix(" 像素")
+        sf.addWidget(self.spn_w, 1, 1)
+        sf.addWidget(QLabel("高度(H)："), 2, 0)
+        self.spn_h = QSpinBox()
+        self.spn_h.setRange(1, 16384)
+        self.spn_h.setValue(cur_h)
+        self.spn_h.setSuffix(" 像素")
+        sf.addWidget(self.spn_h, 2, 1)
+        self.chk_constrain = QCheckBox("约束比例")
+        self.chk_constrain.setChecked(True)
+        sf.addWidget(self.chk_constrain, 3, 0, 1, 4)
+        self._ratio = cur_h / cur_w if cur_w else 1.0
+        self._base_w = cur_w                 # 100% 基准（用于百分比换算）
+        self._base_h = cur_h
+        self.spn_w.valueChanged.connect(self._on_w)
+        self.spn_h.valueChanged.connect(self._on_h)
+        self._lock = False
+        lay.addWidget(size_box)
+
+        # 百分比
+        rowp = QHBoxLayout()
+        rowp.addWidget(QLabel("缩放百分比："))
+        self.spn_pct = QDoubleSpinBox()
+        self.spn_pct.setRange(1, 2000)
+        self.spn_pct.setDecimals(1)
+        self.spn_pct.setValue(100.0)
+        self.spn_pct.setSuffix(" %")
+        self.spn_pct.valueChanged.connect(self._on_pct)
+        rowp.addWidget(self.spn_pct, 1)
+        lay.addLayout(rowp)
+
+        btns = QDialogButtonBox(QDialogButtonBox.Ok
+                                | QDialogButtonBox.Cancel)
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        lay.addWidget(btns)
+
+    def _on_w(self, v: int):
+        if self._lock or not self.chk_constrain.isChecked():
+            return
+        self._lock = True
+        self.spn_h.setValue(max(1, int(round(v * self._ratio))))
+        self._lock = False
+        self._sync_pct()
+
+    def _on_h(self, v: int):
+        if self._lock or not self.chk_constrain.isChecked():
+            return
+        self._lock = True
+        self.spn_w.setValue(max(1, int(round(v / self._ratio))))
+        self._lock = False
+        self._sync_pct()
+
+    def _on_pct(self, p: float):
+        # 百分比驱动像素尺寸（保持比例）
+        if self._lock:
+            return
+        self._lock = True
+        self.spn_w.setValue(max(1, int(round(self._base_w * p / 100))))
+        self.spn_h.setValue(max(1, int(round(self._base_h * p / 100))))
+        self._lock = False
+
+    def _sync_pct(self):
+        if self._lock:
+            return
+        self._lock = True
+        self.spn_pct.setValue(self.spn_w.value() / self._base_w * 100)
+        self._lock = False
+
+    def result_scale(self) -> float:
+        return self.spn_w.value() / self._base_w if self._base_w else 1.0
+
+
 # ===================== 图层行（眼睛+缩略图+名称+缩放） =====================
 
 class LayerRow(QFrame):
@@ -398,6 +633,7 @@ class LayerRow(QFrame):
         super().__init__()
         self.key = key
         self._selected = False
+        self._marqueed = False           # 框选多选标记（☑）
         self._visible = True
         self.setFrameShape(QFrame.StyledPanel)
         self.setCursor(Qt.PointingHandCursor)
@@ -418,6 +654,14 @@ class LayerRow(QFrame):
             "QToolButton:hover{background:#3a3a3a;border-radius:4px;}")
         self.eye.toggled.connect(self._on_eye)
         lay.addWidget(self.eye)
+
+        # 多选复选框（框选/手动多选）
+        self.chk = QCheckBox()
+        self.chk.setCursor(Qt.PointingHandCursor)
+        self.chk.setToolTip("选中该图层（多选）")
+        self.chk.stateChanged.connect(
+            lambda s: self._on_marquee_toggle(bool(s)))
+        lay.addWidget(self.chk)
 
         # 缩略图
         self.thumb = QLabel()
@@ -492,13 +736,28 @@ class LayerRow(QFrame):
         self.thumb.setPixmap(pm.scaled(
             self.thumb.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
 
+    def _on_marquee_toggle(self, checked: bool):
+        if checked != self._marqueed:
+            self._marqueed = checked
+            self._set_style()
+
+    def set_marqueed(self, m: bool):
+        if m != self._marqueed:
+            self._marqueed = m
+            self.chk.blockSignals(True)
+            self.chk.setChecked(m)
+            self.chk.blockSignals(False)
+            self._set_style()
+
     def set_selected(self, sel: bool):
         self._selected = sel
         self._set_style()
 
     def _set_style(self):
         if self._selected:
-            border, bg = "#f1c40f", "#1a3a5c"
+            border, bg = "#f1c40f", "#1a3a5c"      # 主选：金框
+        elif self._marqueed:
+            border, bg = "#5dade2", "#16324f"      # 框选：蓝框
         else:
             border, bg = "#444444", "#1e1e1e"
         self.setStyleSheet(
@@ -529,7 +788,10 @@ class FrameExportPage(QWidget):
         self._batch_id = ""
         self._batch_mark: Optional[float] = None
         self.preview_cache: Dict[str, Tuple[np.ndarray, float]] = {}
+        # 各图非透明像素包围盒（全分辨率 l,t,r,b，右/下开区间），供框选命中
+        self._alpha_bbox: Dict[str, Tuple[int, int, int, int]] = {}
         self.selected_key: Optional[str] = None
+        self.selected_keys: set = set()          # 框选/多选的图层集合
         self.layer_rows: List[LayerRow] = []
         self._layer_scales: Dict[str, int] = {}
         self._layer_visible: Dict[str, bool] = {}
@@ -574,6 +836,8 @@ class FrameExportPage(QWidget):
         self.view.drag_delta.connect(self._on_canvas_drag)
         self.view.drag_finished.connect(self._on_drag_finished)
         self.view.resized.connect(self._resize_timer.start)
+        self.view.marquee_done.connect(self._on_marquee_done)
+        self.view.marquee_changed.connect(self._on_marquee_changed)
         lv.addWidget(self.view, 1)
         self.info_label = QLabel("尚未加载图片")
         self.info_label.setStyleSheet("color:#f1c40f;font-size:12px;")
@@ -587,12 +851,7 @@ class FrameExportPage(QWidget):
         right = QVBoxLayout()
         right.setSpacing(8)
 
-        # ---- 上半：导出参数 ----
-        params_box = QGroupBox("导出参数")
-        pv = QVBoxLayout(params_box)
-        pv.setSpacing(6)
-
-        # 画布与工具
+        # ---- 上半：画布与工具 ----
         tool_box = QGroupBox("画布与工具")
         tf = QVBoxLayout(tool_box)
         tf.setSpacing(5)
@@ -607,17 +866,26 @@ class FrameExportPage(QWidget):
         self.btn_tool_scale.setText("⤢ 缩放")
         self.btn_tool_scale.setCheckable(True)
         self.btn_tool_scale.setToolTip("选中图片后，在画布上左右拖拽调整大小")
+        self.btn_tool_marquee = QToolButton()
+        self.btn_tool_marquee.setText("☐ 框选")
+        self.btn_tool_marquee.setCheckable(True)
+        self.btn_tool_marquee.setToolTip(
+            "框选多个图层（Shift 加选），切回移动/缩放可对整组操作")
         from PySide6.QtWidgets import QButtonGroup
         self.tool_group = QButtonGroup(self)
         self.tool_group.setExclusive(True)
         self.tool_group.addButton(self.btn_tool_move)
         self.tool_group.addButton(self.btn_tool_scale)
+        self.tool_group.addButton(self.btn_tool_marquee)
         self.btn_tool_move.clicked.connect(
             lambda: self.view.set_tool("move"))
         self.btn_tool_scale.clicked.connect(
             lambda: self.view.set_tool("scale"))
+        self.btn_tool_marquee.clicked.connect(
+            lambda: self.view.set_tool("marquee"))
         rowt.addWidget(self.btn_tool_move)
         rowt.addWidget(self.btn_tool_scale)
+        rowt.addWidget(self.btn_tool_marquee)
         btn_zero = QPushButton("位置归零")
         btn_zero.setToolTip("选中图片回到画布中心（可撤销）")
         btn_zero.clicked.connect(self._reset_selected_offset)
@@ -629,11 +897,6 @@ class FrameExportPage(QWidget):
         self.btn_undo_sel.setEnabled(False)
         rowt.addWidget(self.btn_undo_sel)
         rowt.addStretch()
-        self.btn_import = QPushButton("📥 导入图片…")
-        self.btn_import.setToolTip(
-            "把外部 PNG 图片复制进当前批次，作为新图层参与工作台与导出")
-        self.btn_import.clicked.connect(self._import_images)
-        rowt.addWidget(self.btn_import)
         tf.addLayout(rowt)
 
         # 视图缩放：滚轮以鼠标为锚缩放，中键拖拽平移，双击复位
@@ -663,51 +926,60 @@ class FrameExportPage(QWidget):
             self.zoom_label.setText(f"{pct}%")
         tf.addLayout(rowz)
 
-        rowc = QHBoxLayout()
-        self.chk_canvas_auto = QCheckBox("画板自动（取最大帧）")
+        # 画布宽高作为内部数据存储（隐藏），由「画布大小」对话框驱动；
+        # 持久化与 _canvas_size 仍依赖这三个控件
+        self.chk_canvas_auto = QCheckBox()
         self.chk_canvas_auto.setChecked(True)
-        rowc.addWidget(self.chk_canvas_auto)
-        rowc.addStretch()
-        rowc.addWidget(QLabel("宽"))
         self.spn_cw = QSpinBox()
         self.spn_cw.setRange(16, 16384)
         self.spn_cw.setValue(1024)
-        self.spn_cw.setEnabled(False)
-        rowc.addWidget(self.spn_cw)
-        rowc.addWidget(QLabel("高"))
         self.spn_ch = QSpinBox()
         self.spn_ch.setRange(16, 16384)
         self.spn_ch.setValue(1024)
-        self.spn_ch.setEnabled(False)
-        rowc.addWidget(self.spn_ch)
-        self.chk_canvas_auto.toggled.connect(
-            lambda on: (self.spn_cw.setEnabled(not on),
-                        self.spn_ch.setEnabled(not on)))
+        for _w in (self.chk_canvas_auto, self.spn_cw, self.spn_ch):
+            _w.setVisible(False)
+            tf.addWidget(_w)
         self.chk_canvas_auto.toggled.connect(self._on_setting_changed)
         self.spn_cw.valueChanged.connect(self._on_setting_changed)
         self.spn_ch.valueChanged.connect(self._on_setting_changed)
+
+        # PS 风格「画布大小 / 图像大小」对话框入口
+        rowc = QHBoxLayout()
+        self.btn_canvas_size = QPushButton("画布大小…")
+        self.btn_canvas_size.setToolTip(
+            "调整画板宽高（图像内容不动），支持相对与九宫格定位")
+        self.btn_canvas_size.clicked.connect(self._open_canvas_size)
+        rowc.addWidget(self.btn_canvas_size)
+        self.btn_image_size = QPushButton("图像大小…")
+        self.btn_image_size.setToolTip(
+            "整幅画布与所有图层一起按比例缩放（各图可单独撤销）")
+        self.btn_image_size.clicked.connect(self._open_image_size)
+        rowc.addWidget(self.btn_image_size)
+        self.canvas_label = QLabel("画布尺寸：-")
+        self.canvas_label.setStyleSheet("color:#2ecc71;")
+        rowc.addWidget(self.canvas_label)
+        rowc.addStretch()
         tf.addLayout(rowc)
-        pv.addWidget(tool_box)
+        right.addWidget(tool_box, 0)
 
         # 精灵图参数
         sprite_box = QGroupBox("精灵图 PNG")
         sf = QVBoxLayout(sprite_box)
         sf.setSpacing(5)
         row1 = QHBoxLayout()
-        self.chk_auto_cols = QCheckBox("自动列数（近方形）")
-        self.chk_auto_cols.setChecked(True)
+        self.chk_auto_cols = QCheckBox("自动行数（近方形）")
+        self.chk_auto_cols.setChecked(False)
         self.chk_auto_cols.toggled.connect(self._on_setting_changed)
         row1.addWidget(self.chk_auto_cols)
         row1.addStretch()
-        self.spn_cols = QSpinBox()
-        self.spn_cols.setRange(1, 999)
-        self.spn_cols.setValue(4)
-        self.spn_cols.setEnabled(False)
-        self.spn_cols.valueChanged.connect(self._on_setting_changed)
+        self.spn_rows = QSpinBox()
+        self.spn_rows.setRange(1, 999)
+        self.spn_rows.setValue(1)
+        self.spn_rows.valueChanged.connect(self._on_setting_changed)
         self.chk_auto_cols.toggled.connect(
-            lambda on: self.spn_cols.setEnabled(not on))
-        row1.addWidget(QLabel("列数"))
-        row1.addWidget(self.spn_cols)
+            lambda on: self.spn_rows.setEnabled(not on))
+        row1.addWidget(QLabel("行数"))
+        row1.addWidget(self.spn_rows)
         row1.addWidget(QLabel("间距"))
         self.spn_pad = QSpinBox()
         self.spn_pad.setRange(0, 500)
@@ -716,23 +988,6 @@ class FrameExportPage(QWidget):
         self.spn_pad.valueChanged.connect(self._on_setting_changed)
         row1.addWidget(self.spn_pad)
         sf.addLayout(row1)
-
-        row2 = QHBoxLayout()
-        row2.addWidget(QLabel("分辨率缩放："))
-        self.sld_scale = QSlider(Qt.Horizontal)
-        self.sld_scale.setRange(10, 400)
-        self.sld_scale.setValue(100)
-        self.spn_scale = QSpinBox()
-        self.spn_scale.setRange(10, 400)
-        self.spn_scale.setSuffix(" %")
-        self.spn_scale.setValue(100)
-        self.spn_scale.setFixedWidth(86)
-        self.sld_scale.valueChanged.connect(self.spn_scale.setValue)
-        self.spn_scale.valueChanged.connect(self.sld_scale.setValue)
-        self.sld_scale.valueChanged.connect(self._on_setting_changed)
-        row2.addWidget(self.sld_scale, 1)
-        row2.addWidget(self.spn_scale)
-        sf.addLayout(row2)
 
         row3 = QHBoxLayout()
         self.size_label = QLabel("输出尺寸：-")
@@ -745,59 +1000,40 @@ class FrameExportPage(QWidget):
         row3.addWidget(self.chk_sprite_preview)
         sf.addLayout(row3)
 
+        row4 = QHBoxLayout()
         self.btn_export_sprite = QPushButton("💾 导出精灵图 PNG")
         self.btn_export_sprite.clicked.connect(self._export_sprite)
-        sf.addWidget(self.btn_export_sprite)
-        pv.addWidget(sprite_box)
-
-        # PSD 参数
-        psd_box = QGroupBox("PSD 分层图")
-        pf = QVBoxLayout(psd_box)
-        pf.setSpacing(5)
-        self.canvas_label = QLabel("画布尺寸：-")
-        self.canvas_label.setStyleSheet("color:#2ecc71;")
-        pf.addWidget(self.canvas_label)
-
-        row4 = QHBoxLayout()
-        row4.addWidget(QLabel("统一缩放"))
-        self.spn_all = QSpinBox()
-        self.spn_all.setRange(5, 400)
-        self.spn_all.setValue(100)
-        self.spn_all.setSuffix(" %")
-        self.spn_all.setFixedWidth(82)
-        row4.addWidget(self.spn_all)
-        btn_apply_all = QPushButton("应用到全部图层")
-        btn_apply_all.clicked.connect(self._apply_scale_all)
-        row4.addWidget(btn_apply_all)
-        btn_reset_all = QPushButton("全部100%")
-        btn_reset_all.clicked.connect(self._reset_scale_all)
-        row4.addWidget(btn_reset_all)
-        row4.addStretch()
-        pf.addLayout(row4)
-
-        row5 = QHBoxLayout()
-        btn_all_show = QPushButton("全部显示")
-        btn_all_show.clicked.connect(lambda: self._set_all_visible(True))
-        row5.addWidget(btn_all_show)
-        btn_all_hide = QPushButton("全部隐藏")
-        btn_all_hide.clicked.connect(lambda: self._set_all_visible(False))
-        row5.addWidget(btn_all_hide)
-        row5.addStretch()
-        self.btn_export_psd = QPushButton("💾 导出 PSD 分层图")
-        self.btn_export_psd.clicked.connect(self._export_psd)
-        row5.addWidget(self.btn_export_psd)
-        pf.addLayout(row5)
-
+        row4.addWidget(self.btn_export_sprite)
         btn_open = QPushButton("📂 打开导出目录")
         btn_open.clicked.connect(self._open_export_dir)
-        pf.addWidget(btn_open)
-        pv.addWidget(psd_box)
-        right.addWidget(params_box, 0)
+        row4.addWidget(btn_open)
+        sf.addLayout(row4)
+        right.addWidget(sprite_box, 0)
 
         # ---- 下半：所有图片（单列，眼睛+缩略图+缩放） ----
         list_box = QGroupBox("所有图片（👁=是否显示，点击行选中）")
         gl = QVBoxLayout(list_box)
         gl.setContentsMargins(4, 6, 4, 4)
+        # 标题行：小眼睛总开关（全部显示/隐藏）
+        head = QHBoxLayout()
+        self.eye_all = QToolButton()
+        self.eye_all.setText("👁")
+        self.eye_all.setFixedSize(28, 28)
+        self.eye_all.setCursor(Qt.PointingHandCursor)
+        self.eye_all.setToolTip("全部显示 / 全部隐藏")
+        self.eye_all.setStyleSheet(
+            "QToolButton{background:transparent;border:none;font-size:15px;}"
+            "QToolButton:hover{background:#3a3f4b;border-radius:4px;}")
+        self.eye_all.clicked.connect(self._toggle_all_visible)
+        head.addWidget(self.eye_all)
+        head.addWidget(QLabel("图层列表"))
+        head.addStretch()
+        self.btn_import = QPushButton("📥 导入图片…")
+        self.btn_import.setToolTip(
+            "把外部 PNG 图片复制进当前批次，作为新图层参与工作台与导出")
+        self.btn_import.clicked.connect(self._import_images)
+        head.addWidget(self.btn_import)
+        gl.addLayout(head)
         self.layer_scroll = QScrollArea()
         self.layer_scroll.setWidgetResizable(True)
         self.layer_scroll.setStyleSheet(
@@ -918,6 +1154,9 @@ class FrameExportPage(QWidget):
         self._undo_coalesce = {}
         self._drag_pending = None
         self._ws_cache = None
+        self.selected_keys = set()
+        self._canvas_anchor = (1, 1)       # 画布扩展定位 (row,col) 0..2
+        self._canvas_ext_color = "透明"
         for i, fn in enumerate(files, 1):
             src, stage = self._best_source(fn, colored_dir,
                                            refined_dir, matted_dir)
@@ -1019,13 +1258,13 @@ class FrameExportPage(QWidget):
         self._undo_coalesce = {}
         self._drag_pending = None
         self._ws_cache = None
+        self.selected_keys = set()
         self._update_undo_ui()
         self.view.set_image(None)
         self.info_label.setText(text)
         self.size_label.setText("输出尺寸：-")
         self.canvas_label.setText("画布尺寸：-")
         self.btn_export_sprite.setEnabled(False)
-        self.btn_export_psd.setEnabled(False)
         while self.layer_layout.count() > 1:
             it = self.layer_layout.takeAt(0)
             if it.widget():
@@ -1048,10 +1287,18 @@ class FrameExportPage(QWidget):
         self.loader.start()
         # 导出读的是全分辨率原文件，不依赖预览缓存，立即可用
         self.btn_export_sprite.setEnabled(True)
-        self.btn_export_psd.setEnabled(True)
 
     def _on_preview_one(self, key: str, img: np.ndarray, factor: float):
         self.preview_cache[key] = (img, factor)
+        # 非透明像素包围盒（换算回全分辨率，右/下开区间），供框选命中
+        a = img[:, :, 3]
+        ys, xs = np.nonzero(a)
+        if len(xs):
+            inv = 1.0 / factor if factor > 0 else 1.0
+            self._alpha_bbox[key] = (int(xs.min() * inv),
+                                     int(ys.min() * inv),
+                                     int(np.ceil((xs.max() + 1) * inv)),
+                                     int(np.ceil((ys.max() + 1) * inv)))
         for r in self.layer_rows:
             if r.key == key:
                 r.set_thumbnail(img)
@@ -1076,8 +1323,8 @@ class FrameExportPage(QWidget):
 
     UNDO_LIMIT = 50
 
-    def _layer_transform(self, key: str) -> Tuple[int, float, float]:
-        pct = int(self._layer_scales.get(key, 100))
+    def _layer_transform(self, key: str) -> Tuple[float, float, float]:
+        pct = float(self._layer_scales.get(key, 100.0))
         ox, oy = self._layer_offsets.get(key, (0.0, 0.0))
         return pct, float(ox), float(oy)
 
@@ -1110,8 +1357,10 @@ class FrameExportPage(QWidget):
             self._layer_offsets[key] = [ox, oy]
         row = next((r for r in self.layer_rows if r.key == key), None)
         if row is not None:
+            disp = max(row.spin.minimum(),
+                       min(row.spin.maximum(), int(round(pct))))
             row.spin.blockSignals(True)
-            row.spin.setValue(pct)
+            row.spin.setValue(disp)
             row.spin.blockSignals(False)
         self._undo_coalesce[key] = time.monotonic()
         self._ws_cache = None
@@ -1132,6 +1381,78 @@ class FrameExportPage(QWidget):
         self.btn_undo_sel.setEnabled(n > 0)
         self.btn_undo_sel.setText(f"↩ 撤销本图（{n}）" if n else "↩ 撤销本图")
 
+    # ---------- 框选多选 ----------
+
+    def _marquee_hit(self, rect, it) -> bool:
+        """图层非透明内容在画布上的实际位置是否与框选矩形相交"""
+        key = it["key"]
+        # 优先用非透明像素包围盒；尚无（未加载）时回退整帧
+        bbox = self._alpha_bbox.get(key)
+        if bbox is None:
+            bbox = (0, 0, it["w"], it["h"])
+        l, t, r, b = bbox
+        ox, oy = self._layer_offsets.get(key, (0.0, 0.0))
+        pf = self._workspace_preview_factor(*self._canvas_size())
+        cw, ch = self._canvas_size()
+        pw, ph = int(cw * pf), int(ch * pf)
+        k = self._layer_scales.get(key, 100) / 100.0
+        # 图层缩放后仍按整帧中心居中，包围盒随缩放一起平移
+        fw, fh = it["w"] * k * pf, it["h"] * k * pf
+        fx, fy = eu.centered_xy(pw, ph, fw, fh)
+        fx += ox * pf
+        fy += oy * pf
+        x0 = fx + l * k * pf
+        y0 = fy + t * k * pf
+        x1 = fx + r * k * pf
+        y1 = fy + b * k * pf
+        rx0, ry0 = rect.x(), rect.y()
+        rx1, ry1 = rx0 + rect.width(), ry0 + rect.height()
+        return not (x0 >= rx1 or x1 <= rx0 or y0 >= ry1 or y1 <= ry0)
+
+    def _marquee_keys(self, rect) -> List[str]:
+        return [it["key"] for it in self.items
+                if self._layer_visible.get(it["key"], True)
+                and self._marquee_hit(rect, it)]
+
+    def _on_marquee_changed(self, rect, additive: bool):
+        hits = self._marquee_keys(rect)
+        if additive:
+            hits = sorted(set(self.selected_keys) | set(hits))
+        self._apply_marquee_selection(hits, transient=True)
+
+    def _on_marquee_done(self, rect, additive: bool):
+        hits = self._marquee_keys(rect)
+        if additive:
+            hits = sorted(set(self.selected_keys) | set(hits))
+        self._apply_marquee_selection(hits, transient=False)
+
+    def _apply_marquee_selection(self, keys: List[str], transient: bool):
+        self.selected_keys = set(keys)
+        for r in self.layer_rows:
+            r.set_marqueed(r.key in self.selected_keys)
+        n = len(self.selected_keys)
+        if n:
+            # 若主选不在组内，把组内第一个提升为主选（供撤销/缩放参考）
+            if self.selected_key not in self.selected_keys:
+                self.selected_key = sorted(self.selected_keys)[0]
+                self._sync_row_selection()
+                self._update_undo_ui()
+            self.info_label.setText(
+                f"已框选 {n} 个图层"
+                + ("（预览）" if transient else
+                   "，切到移动/缩放工具可整组操作"))
+        elif not transient:
+            self.info_label.setText("框选为空")
+        if not transient:
+            self._render_workspace()
+
+    def _clear_marquee(self):
+        if self.selected_keys:
+            self.selected_keys = set()
+            for r in self.layer_rows:
+                r.set_marqueed(False)
+            self._render_workspace()
+
     # ---------- 画布拖拽交互 ----------
 
     def _on_drag_started(self):
@@ -1148,26 +1469,132 @@ class FrameExportPage(QWidget):
             self._ws_cache = None      # 预览分辨率随控件变化，缓存失效
             self._render_preview()
 
-    def _on_canvas_drag(self, dx: float, dy: float):
-        """移动工具=拖动选中图层位置；缩放工具=横向拖拽调大小"""
+    def _drag_keys(self) -> List[str]:
+        """本次拖拽作用的目标图层：主选优先；若在框选组内则整组"""
         key = self.selected_key
         if not key:
+            return []
+        if self.selected_keys and key in self.selected_keys:
+            # 仅可见图层参与成组操作，且组内至少要有当前主选
+            return sorted(k for k in self.selected_keys
+                          if self._layer_visible.get(k, True))
+        return [key]
+
+    def _on_canvas_drag(self, dx: float, dy: float):
+        """移动工具=拖动位置；缩放工具=横向拖拽调大小（支持整组）"""
+        keys = self._drag_keys()
+        if not keys:
             return
+        key = self.selected_key
         if self._drag_pending == key:
-            self._push_undo(key)       # 拖拽事务首个变化：入栈一次
+            for k in keys:
+                self._push_undo(k)     # 拖拽事务首个变化：整组各入栈一次
             self._drag_pending = None
         if self.view.tool == "move":
-            ox, oy = self._layer_offsets.get(key, (0.0, 0.0))
-            self._layer_offsets[key] = [ox + dx, oy + dy]
+            for k in keys:
+                ox, oy = self._layer_offsets.get(k, (0.0, 0.0))
+                self._layer_offsets[k] = [ox + dx, oy + dy]
             # 拖拽中静态层命中缓存，单帧仅 ~3ms，立即跟手渲染
             self._render_preview()
         else:
-            row = next((r for r in self.layer_rows if r.key == key), None)
-            if row is not None:
-                cur = row.spin.value()
-                new = max(5, min(400, int(round(cur + dx * 0.5))))
-                if new != cur:
-                    row.spin.setValue(new)   # 触发 changed → 预览+保存
+            for k in keys:
+                row = next((r for r in self.layer_rows
+                            if r.key == k), None)
+                if row is not None:
+                    cur = row.spin.value()
+                    new = max(5, min(400, int(round(cur + dx * 0.5))))
+                    if new != cur:
+                        row.spin.setValue(new)  # 触发 changed → 预览+保存
+
+    # ---------- PS 风格「画布大小 / 图像大小」 ----------
+
+    def _open_canvas_size(self):
+        """画布大小：改画板宽高，图像内容不动，九宫格定位决定留白方向"""
+        if not self.items:
+            self.status_text("当前没有批次，无法调整画布")
+            return
+        cw, ch = self._canvas_size()
+        dlg = CanvasSizeDialog(self, cw, ch, cw, ch,
+                               self._canvas_anchor,
+                               self._canvas_ext_color)
+        if dlg.exec() != QDialog.Accepted:
+            return
+        new_w, new_h, anchor, color = dlg.result_values()
+        self._canvas_anchor = anchor
+        self._canvas_ext_color = color
+        # 切为手动并写入新宽高
+        self.chk_canvas_auto.setChecked(False)
+        self.spn_cw.setValue(new_w)
+        self.spn_ch.setValue(new_h)
+        self._apply_canvas_anchor(cw, ch, new_w, new_h, anchor)
+        self.status_text(
+            f"画布大小 {cw}×{ch} → {new_w}×{new_h}"
+            f"（锚点 {['左上','上','右上','左','中','右','左下','下','右下'][anchor[0]*3+anchor[1]]}，"
+            f"扩展颜色 {color}）")
+
+    def _apply_canvas_anchor(self, old_w: int, old_h: int,
+                             new_w: int, new_h: int,
+                             anchor: Tuple[int, int]):
+        """按九宫格锚点平移所有图层，使图像内容在新画布中位置正确"""
+        dx = new_w - old_w
+        dy = new_h - old_h
+        if dx == 0 and dy == 0:
+            return
+        ar, ac = anchor
+        # 锚点决定内容偏移：中=(0,0)，左上=(-dx/2,-dy/2)，右下=(dx/2,dy/2)
+        off_x = dx * (ac - 1) / 2.0
+        off_y = dy * (ar - 1) / 2.0
+        if off_x == 0 and off_y == 0:
+            return
+        for key in list(self._layer_offsets.keys()):
+            self._push_undo(key)
+            ox, oy = self._layer_offsets[key]
+            self._layer_offsets[key] = [ox + off_x, oy + off_y]
+        self._ws_cache = None
+        self._schedule_preview()
+        self._save_timer.start()
+
+    def _open_image_size(self):
+        """图像大小：整幅画布+所有图层一起按比例缩放"""
+        if not self.items:
+            self.status_text("当前没有批次，无法调整图像大小")
+            return
+        cw, ch = self._canvas_size()
+        dlg = ImageSizeDialog(self, cw, ch)
+        if dlg.exec() != QDialog.Accepted:
+            return
+        scale = dlg.result_scale()
+        if scale <= 0 or abs(scale - 1.0) < 1e-6:
+            return
+        # 画布同步缩放（切为手动；抑制信号避免 setValue 触发
+        # _on_setting_changed 干扰，统一在末尾刷新）
+        new_w = max(1, int(round(cw * scale)))
+        new_h = max(1, int(round(ch * scale)))
+        self.chk_canvas_auto.blockSignals(True)
+        self.spn_cw.blockSignals(True)
+        self.spn_ch.blockSignals(True)
+        self.chk_canvas_auto.setChecked(False)
+        self.spn_cw.setValue(new_w)
+        self.spn_ch.setValue(new_h)
+        self.chk_canvas_auto.blockSignals(False)
+        self.spn_cw.blockSignals(False)
+        self.spn_ch.blockSignals(False)
+        # 所有图层（含从未动过的）缩放与偏移同步按比例变化（各入一个撤销点）
+        for it in self.items:
+            key = it["key"]
+            self._push_undo(key)
+            cur = self._layer_scales.get(key, 100)
+            self._layer_scales[key] = max(0.01, float(cur) * scale)
+            ox, oy = self._layer_offsets.get(key, (0.0, 0.0))
+            if ox or oy:
+                self._layer_offsets[key] = [ox * scale, oy * scale]
+        self._ws_cache = None
+        self._sync_row_scales()
+        self._render_preview()
+        self._save_timer.start()
+        self.status_text(
+            f"图像大小已整体缩放 {scale*100:.1f}%"
+            f"（画布 {new_w}×{new_h}，各图可单独撤销）")
 
     def _reset_selected_offset(self):
         key = self.selected_key
@@ -1182,10 +1609,16 @@ class FrameExportPage(QWidget):
     def _sprite_params(self) -> dict:
         return {
             "auto_columns": self.chk_auto_cols.isChecked(),
-            "columns": self.spn_cols.value(),
+            # 用户填的是行数；换算成列数传给拼接逻辑（列数=ceil(n/行数)）
+            "rows": self.spn_rows.value(),
             "padding": self.spn_pad.value(),
-            "sprite_scale": self.spn_scale.value(),
         }
+
+    def _cols_from_rows(self, rows: int, n: int) -> int:
+        """按目标行数反推列数：ceil(n/rows)，至少 1 列"""
+        if n <= 0:
+            return 0
+        return max(1, int(np.ceil(n / max(1, rows))))
 
     def _on_setting_changed(self):
         self._update_size_info()
@@ -1208,10 +1641,16 @@ class FrameExportPage(QWidget):
         p = self._sprite_params()
         vis = self._visible_items()
         if vis:
+            scaled_sizes = [
+                (it["w"] * self._layer_scales.get(it["key"], 100) / 100.0,
+                 it["h"] * self._layer_scales.get(it["key"], 100) / 100.0)
+                for it in vis]
+            cols_arg = 0 if p["auto_columns"] else \
+                self._cols_from_rows(p["rows"], len(vis))
             W, H, cols, rows = eu.sprite_sheet_size(
-                [(it["w"], it["h"]) for it in vis],
-                columns=0 if p["auto_columns"] else p["columns"],
-                scale=p["sprite_scale"] / 100.0,
+                scaled_sizes,
+                columns=cols_arg,
+                scale=1.0,
                 padding=p["padding"])
             self.size_label.setText(
                 f"输出尺寸：{W} × {H} px（{cols}列×{rows}行，"
@@ -1247,6 +1686,7 @@ class FrameExportPage(QWidget):
     def _select_layer(self, key: str):
         self.selected_key = key
         self.chk_sprite_preview.setChecked(False)
+        self._clear_marquee()
         self._sync_row_selection()
         self._update_undo_ui()
         self._render_preview()
@@ -1254,6 +1694,16 @@ class FrameExportPage(QWidget):
     def _sync_row_selection(self):
         for r in self.layer_rows:
             r.set_selected(r.key == self.selected_key)
+
+    def _sync_row_scales(self):
+        """批量把 _layer_scales 写回各行 spin（抑制信号，显示取整）"""
+        for r in self.layer_rows:
+            pct = int(round(self._layer_scales.get(r.key, 100)))
+            pct = max(r.spin.minimum(), min(r.spin.maximum(), pct))
+            if r.spin.value() != pct:
+                r.spin.blockSignals(True)
+                r.spin.setValue(pct)
+                r.spin.blockSignals(False)
 
     def _on_layer_scale_changed(self, key: str, pct: int):
         # 键盘连按/滚轮/拖拽产生的连续变化合并为一个撤销点
@@ -1280,34 +1730,17 @@ class FrameExportPage(QWidget):
         for r in self.layer_rows:
             r.set_visible(visible)          # 批量设置不发单行信号
             self._layer_visible[r.key] = visible
+        self.eye_all.setText("👁" if visible else "—")
         self._update_size_info()
         self._schedule_preview()
         self._save_timer.start()
         self.status_text("全部图层已显示" if visible else "全部图层已隐藏")
 
-    def _apply_scale_all(self):
-        v = self.spn_all.value()
-        changed = 0
-        for r in self.layer_rows:
-            if r.spin.value() != v:
-                self._push_undo(r.key)    # 入栈旧值并抑制连调重复入栈
-                r.spin.setValue(v)        # 触发 changed → 写 dict / 刷新
-                changed += 1
-        self.status_text(
-            f"已把 {changed} 个图层缩放设为 {v}%（各图可单独撤销）"
-            if changed else f"全部图层已是 {v}%")
-
-    def _reset_scale_all(self):
-        changed = 0
-        for r in self.layer_rows:
-            if r.spin.value() != 100:
-                self._push_undo(r.key)
-                r.spin.setValue(100)
-                changed += 1
-        self.spn_all.setValue(100)
-        self.status_text(
-            f"已将 {changed} 个图层缩放恢复 100%（各图可单独撤销）"
-            if changed else "全部图层已是 100%")
+    def _toggle_all_visible(self):
+        # 只要有任何一个可见图层，就视为"显示中"→切换为全部隐藏
+        any_visible = any(
+            self._layer_visible.get(r.key, True) for r in self.layer_rows)
+        self._set_all_visible(not any_visible)
 
     # ---------- 工作台渲染 ----------
 
@@ -1426,18 +1859,23 @@ class FrameExportPage(QWidget):
             self.info_label.setText("没有可见图层可拼接")
             return
         p = self._sprite_params()
-        user_scale = p["sprite_scale"] / 100.0
-        cols_arg = 0 if p["auto_columns"] else p["columns"]
-        # 用各帧原始尺寸推算全分辨率输出，再整体缩到预览上限
+        cols_arg = 0 if p["auto_columns"] else \
+            self._cols_from_rows(p["rows"], len(ready))
+        # 用各帧原始尺寸×各自图层缩放推算全分辨率输出，再整体缩到预览上限
+        scaled_sizes = [
+            (it["w"] * self._layer_scales.get(it["key"], 100) / 100.0,
+             it["h"] * self._layer_scales.get(it["key"], 100) / 100.0)
+            for it, _ in ready]
         W0, H0, cols, rows = eu.sprite_sheet_size(
-            [(it["w"], it["h"]) for it, _ in ready],
-            columns=cols_arg, scale=user_scale, padding=p["padding"])
+            scaled_sizes,
+            columns=cols_arg, scale=1.0, padding=p["padding"])
         target = min(float(self.PREVIEW_MAX),
                      float(max(1, self.view.width(), self.view.height())))
         pf = min(1.0, target / max(1.0, max(W0, H0)))
         sims = []
         for it, (im, cf) in ready:
-            sims.append(eu.scale_bgra(im, user_scale * pf / cf))
+            layer_scale = self._layer_scales.get(it["key"], 100) / 100.0
+            sims.append(eu.scale_bgra(im, layer_scale * pf / cf))
         sheet, _ = eu.build_sprite_sheet(
             sims, columns=cols_arg, scale=1.0,
             padding=max(0, int(round(p["padding"] * pf))))
@@ -1448,30 +1886,26 @@ class FrameExportPage(QWidget):
 
     # ---------- 导出 ----------
 
-    def _export(self, mode: str):
+    def _export_sprite(self):
         if not self.items or self.worker is not None:
             return
-        name = "sprite_sheet.png" if mode == "sprite" else "layers.psd"
-        out_path = os.path.join(self.export_dir, name)
+        out_path = os.path.join(self.export_dir, "sprite_sheet.png")
         params = self._sprite_params()
         params["layer_scales"] = dict(self._layer_scales)
         params["layer_visible"] = dict(self._layer_visible)
         params["layer_offsets"] = dict(self._layer_offsets)
         params["canvas_wh"] = self._canvas_size()
-        self.worker = _ExportWorker(mode, self.items, params, out_path)
+        # 换算好列数传给 worker（0=自动近方形；否则按目标行数反推）
+        n_vis = sum(1 for it in self.items if self._visible(it))
+        params["columns"] = 0 if params["auto_columns"] else \
+            self._cols_from_rows(params["rows"], n_vis)
+        self.worker = _ExportWorker("sprite", self.items, params, out_path)
         self.worker.progress.connect(self.status_text)
         self.worker.failed.connect(self._on_export_failed)
         self.worker.finished_ok.connect(self._on_export_ok)
         self.worker.finished.connect(self._on_worker_end)
         self.btn_export_sprite.setEnabled(False)
-        self.btn_export_psd.setEnabled(False)
         self.worker.start()
-
-    def _export_sprite(self):
-        self._export("sprite")
-
-    def _export_psd(self):
-        self._export("psd")
 
     def _on_export_ok(self, mode: str, path: str):
         self.shared_state["export_dir"] = self.export_dir
@@ -1485,7 +1919,6 @@ class FrameExportPage(QWidget):
     def _on_worker_end(self):
         self.worker = None
         self.btn_export_sprite.setEnabled(True)
-        self.btn_export_psd.setEnabled(True)
 
     def _open_export_dir(self):
         if self.export_dir and os.path.isdir(self.export_dir):
@@ -1509,16 +1942,18 @@ class FrameExportPage(QWidget):
                 data = json.load(f)
         except Exception:
             data = {}
-        self.chk_auto_cols.setChecked(bool(data.get("auto_columns", True)))
-        self.spn_cols.setValue(int(data.get("columns", 4)))
+        self.chk_auto_cols.setChecked(bool(data.get("auto_columns", False)))
+        self.spn_rows.setValue(int(data.get("rows", 1)))
         self.spn_pad.setValue(int(data.get("padding", 0)))
-        self.spn_scale.setValue(max(10, min(400,
-                                            int(data.get("sprite_scale", 100)))))
         self.chk_sprite_preview.setChecked(
             bool(data.get("sprite_preview", False)))
         self.chk_canvas_auto.setChecked(bool(data.get("canvas_auto", True)))
         self.spn_cw.setValue(max(16, int(data.get("canvas_w", 1024))))
         self.spn_ch.setValue(max(16, int(data.get("canvas_h", 1024))))
+        anc = data.get("canvas_anchor", [1, 1])
+        if isinstance(anc, (list, tuple)) and len(anc) == 2:
+            self._canvas_anchor = (int(anc[0]), int(anc[1]))
+        self._canvas_ext_color = str(data.get("canvas_ext_color", "透明"))
         keys = {it["key"] for it in self.items}
         saved_scales = data.get("layer_scales", {})
         self._layer_scales = {
@@ -1539,13 +1974,14 @@ class FrameExportPage(QWidget):
         os.makedirs(self.export_dir, exist_ok=True)
         data = {
             "auto_columns": self.chk_auto_cols.isChecked(),
-            "columns": self.spn_cols.value(),
+            "rows": self.spn_rows.value(),
             "padding": self.spn_pad.value(),
-            "sprite_scale": self.spn_scale.value(),
             "sprite_preview": self.chk_sprite_preview.isChecked(),
             "canvas_auto": self.chk_canvas_auto.isChecked(),
             "canvas_w": self.spn_cw.value(),
             "canvas_h": self.spn_ch.value(),
+            "canvas_anchor": list(self._canvas_anchor),
+            "canvas_ext_color": self._canvas_ext_color,
             "layer_scales": self._layer_scales,
             "layer_visible": self._layer_visible,
             "layer_offsets": self._layer_offsets,
