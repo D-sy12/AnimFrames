@@ -20,7 +20,7 @@ from typing import Optional, List, Dict, Tuple
 import numpy as np
 import cv2
 
-from PySide6.QtCore import Qt, QTimer, Signal, QPointF, QRect
+from PySide6.QtCore import Qt, QTimer, Signal, QPointF, QRect, QRectF
 from PySide6.QtGui import (
     QPixmap, QImage, QColor, QPainter, QPen, QKeySequence, QShortcut,
 )
@@ -114,13 +114,16 @@ class EditState:
 # ===================== 可涂抹画布 =====================
 
 class RefineCanvas(QWidget):
-    """显示工作图（棋盘格透明底），接收鼠标涂抹"""
+    """显示工作图（棋盘格透明底），接收鼠标涂抹；支持滚轮缩放/拖拽平移"""
 
     TOOL_COLORS = {
         "erase": QColor(231, 76, 60),       # 红
         "bg": QColor(241, 196, 15),          # 黄
         "restore": QColor(46, 204, 113),    # 绿
     }
+
+    ZOOM_MIN = 1.0      # 1 = 适应窗口
+    ZOOM_MAX = 24.0
 
     def __init__(self, page: "FrameRefinePage"):
         super().__init__()
@@ -131,101 +134,232 @@ class RefineCanvas(QWidget):
         self.setStyleSheet("background:#2b2b2b;border:1px solid #444;")
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
 
-        self._scene: Optional[QPixmap] = None   # 棋盘+缩放后图片
-        self._hover: Optional[QPointF] = None   # 原图坐标下的悬停点
+        self._src_pixmap: Optional[QPixmap] = None  # 全尺寸工作图
+        self._hover: Optional[QPointF] = None       # 原图坐标悬停点
         self._drawing = False
+
+        # 视图变换：zoom=1 为适应窗口；center_img 为控件中心对应的原图坐标
+        self._zoom = 1.0
+        self._center_img: Optional[QPointF] = None
+        self._fast = False                 # 交互中用快速缩放
+
+        # 平移
+        self._panning = False
+        self._pan_start_widget = QPointF()
+        self._pan_start_center = QPointF()
+        self._space_held = False
 
     # ---------- 坐标映射 ----------
 
     def image_size(self) -> Optional[Tuple[int, int]]:
         return self.page.image_size()
 
-    def _transform(self) -> Optional[Tuple[float, float, float]]:
-        """返回 scale, offset_x, offset_y（控件坐标）"""
+    def _fit_scale(self) -> Optional[float]:
         sz = self.image_size()
         if sz is None:
             return None
         iw, ih = sz
         if iw <= 0 or ih <= 0:
             return None
-        s = min(self.width() / iw, self.height() / ih)
-        ox = (self.width() - iw * s) / 2.0
-        oy = (self.height() - ih * s) / 2.0
-        return s, ox, oy
+        return min(self.width() / iw, self.height() / ih)
+
+    def _default_center(self, iw: float, ih: float) -> QPointF:
+        return QPointF(iw / 2.0, ih / 2.0)
+
+    def _clamp_center(self, c: QPointF, s: float,
+                      iw: float, ih: float) -> QPointF:
+        """限制视图中心，保证画面不会被拖到完全看不见"""
+        mx = (self.width() / 2.0) / s
+        my = (self.height() / 2.0) / s
+        cx = min(max(c.x(), -mx), iw + mx)
+        cy = min(max(c.y(), -my), ih + my)
+        return QPointF(cx, cy)
+
+    def _transform(self) -> Optional[Tuple[float, float, float, QPointF]]:
+        """返回 scale, offset_x, offset_y, center_img（控件坐标映射）"""
+        sz = self.image_size()
+        fit = self._fit_scale()
+        if sz is None or fit is None:
+            return None
+        iw, ih = sz
+        s = fit * self._zoom
+        if self._center_img is None:
+            self._center_img = self._default_center(iw, ih)
+        c = self._clamp_center(self._center_img, s, iw, ih)
+        self._center_img = c
+        cw = self.width() / 2.0
+        ch = self.height() / 2.0
+        ox = cw - c.x() * s
+        oy = ch - c.y() * s
+        return s, ox, oy, c
 
     def widget_to_image(self, pos: QPointF) -> Optional[Tuple[float, float]]:
         t = self._transform()
         if t is None:
             return None
-        s, ox, oy = t
+        s, ox, oy, _ = t
         return (pos.x() - ox) / s, (pos.y() - oy) / s
 
     # ---------- 场景刷新 ----------
 
     def rebuild_scene(self, smooth: bool = True):
-        """根据 page.work 重建缓存场景"""
+        """根据 page.work 更新全尺寸像素图（保持当前缩放/平移）"""
+        self._fast = not smooth
         work = self.page.work
         if work is None:
-            self._scene = None
+            self._src_pixmap = None
             self.update()
             return
-        bgra = work
-        rgba = cv2.cvtColor(bgra, cv2.COLOR_BGRA2RGBA)
+        rgba = cv2.cvtColor(work, cv2.COLOR_BGRA2RGBA)
         h, w = rgba.shape[:2]
         qimg = QImage(rgba.data, w, h, w * 4, QImage.Format_RGBA8888).copy()
-        pix = QPixmap.fromImage(qimg)
-        mode = Qt.SmoothTransformation if smooth else Qt.FastTransformation
-        scaled = pix.scaled(self.size(), Qt.KeepAspectRatio, mode)
+        self._src_pixmap = QPixmap.fromImage(qimg)
+        if self._center_img is None:
+            self._center_img = self._default_center(w, h)
+        self.update()
 
-        scene = QPixmap(self.size())
-        p = QPainter(scene)
-        p.fillRect(scene.rect(), QColor(43, 43, 43))
-        r = QRect(0, 0, scaled.width(), scaled.height())
-        r.moveCenter(scene.rect().center())
-        p.drawTiledPixmap(r, _checker_tile(12))
-        p.drawPixmap(r.topLeft(), scaled)
-        p.end()
-        self._scene = scene
+    def reset_view(self):
+        """切换图片时：缩放复位到适应窗口、居中"""
+        self._zoom = 1.0
+        sz = self.image_size()
+        self._center_img = (self._default_center(*sz)
+                            if sz is not None else None)
+        self._hover = None
         self.update()
 
     def paintEvent(self, event):
         p = QPainter(self)
-        if self._scene is not None:
-            p.drawPixmap(0, 0, self._scene)
-        else:
-            p.fillRect(self.rect(), QColor(43, 43, 43))
+        p.fillRect(self.rect(), QColor(43, 43, 43))
+
+        if self._src_pixmap is None:
             p.setPen(QColor("#bdc3c7"))
             p.drawText(self.rect(), Qt.AlignCenter,
                        "没有可精抠的图片\n\n请先在「批量抠图」页面处理选中帧")
+        else:
+            t = self._transform()
+            if t is not None:
+                s, ox, oy, _ = t
+                iw = self._src_pixmap.width()
+                ih = self._src_pixmap.height()
+                target = QRectF(ox, oy, iw * s, ih * s)
+                p.setRenderHint(QPainter.SmoothPixmapTransform, not self._fast)
+                # 棋盘格只铺在图片区域
+                p.save()
+                p.setClipRect(target)
+                p.drawTiledPixmap(target, _checker_tile(12))
+                p.drawPixmap(target, self._src_pixmap,
+                             QRectF(0, 0, iw, ih))
+                p.restore()
+
         # 画笔圈
         if self._hover is not None and self.page.work is not None:
             t = self._transform()
             if t is not None:
-                s, ox, oy = t
+                s, ox, oy, _ = t
                 radius = max(1.0, self.page.brush_size() * s)
                 cx = self._hover.x() * s + ox
                 cy = self._hover.y() * s + oy
                 color = self.TOOL_COLORS.get(self.page.tool(), QColor("white"))
-                pen = QPen(color, 1.6)
-                p.setPen(pen)
+                p.setPen(QPen(color, 1.6))
                 p.drawEllipse(QPointF(cx, cy), radius, radius)
-                pen.setColor(QColor(0, 0, 0, 140))
-                pen.setWidthF(0.8)
-                p.setPen(pen)
+                p.setPen(QPen(QColor(0, 0, 0, 140), 0.8))
                 p.drawEllipse(QPointF(cx + 1, cy + 1), radius, radius)
         p.end()
 
+        # 缩放比例角标
+        if self.page.work is not None:
+            p2 = QPainter(self)
+            txt = f"{self._zoom * 100:.0f}%"
+            font = p2.font()
+            font.setPointSize(9)
+            p2.setFont(font)
+            tw = p2.fontMetrics().horizontalAdvance(txt)
+            r = QRect(8, 8, tw + 14, 20)
+            p2.setPen(Qt.NoPen)
+            p2.setBrush(QColor(0, 0, 0, 130))
+            p2.drawRoundedRect(r, 4, 4)
+            p2.setPen(QColor("#ecf0f1"))
+            p2.drawText(r, Qt.AlignCenter, txt)
+            p2.end()
+
     def resizeEvent(self, event):
-        self.rebuild_scene(smooth=True)
+        self.update()
 
     def leaveEvent(self, event):
         self._hover = None
         self.update()
 
-    # ---------- 鼠标涂抹 ----------
+    # ---------- 滚轮缩放（以鼠标位置为锚点） ----------
+
+    def wheelEvent(self, event):
+        if self.page.work is None:
+            return
+        t = self._transform()
+        fit = self._fit_scale()
+        if t is None or fit is None:
+            return
+        mouse = event.position()
+        anchor = self.widget_to_image(mouse)  # 缩放前鼠标下的原图点
+
+        factor = 1.2 ** (event.angleDelta().y() / 120.0)
+        new_zoom = min(max(self._zoom * factor, self.ZOOM_MIN), self.ZOOM_MAX)
+        if abs(new_zoom - self._zoom) < 1e-6:
+            return
+        self._zoom = new_zoom
+        new_s = fit * new_zoom
+
+        # 保持锚点像素不动：center = anchor - (mouse - widgetCenter)/new_s
+        cw = self.width() / 2.0
+        ch = self.height() / 2.0
+        self._center_img = QPointF(
+            anchor[0] - (mouse.x() - cw) / new_s,
+            anchor[1] - (mouse.y() - ch) / new_s)
+        self._fast = False
+        self.update()
+
+    # ---------- 双击复位 ----------
+
+    def mouseDoubleClickEvent(self, event):
+        if event.button() == Qt.LeftButton and self.page.work is not None:
+            # 双击前会先产生一次"按下-抬起"，若没有拖动，撤销那枚误盖笔印
+            if not getattr(self.page, "_stroke_moved", True):
+                self.page._undo()
+            self.reset_view()
+
+    # ---------- 空格键状态（空格+左键 = 平移） ----------
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key_Space and not event.isAutoRepeat():
+            self._space_held = True
+            self.setCursor(Qt.OpenHandCursor)
+        else:
+            super().keyPressEvent(event)
+
+    def keyReleaseEvent(self, event):
+        if event.key() == Qt.Key_Space and not event.isAutoRepeat():
+            self._space_held = False
+            if not self._panning:
+                self.unsetCursor()
+        else:
+            super().keyReleaseEvent(event)
+
+    # ---------- 鼠标涂抹 / 平移 ----------
 
     def mousePressEvent(self, event):
-        if event.button() != Qt.LeftButton or self.page.work is None:
+        if self.page.work is None:
+            return
+        # 中键，或按住空格的左键 → 平移
+        if event.button() == Qt.MiddleButton or (
+                event.button() == Qt.LeftButton and self._space_held):
+            self._panning = True
+            self._pan_start_widget = event.position()
+            t = self._transform()
+            self._pan_start_center = t[3] if t else QPointF()
+            self.setCursor(Qt.ClosedHandCursor)
+            event.accept()
+            return
+
+        if event.button() != Qt.LeftButton:
             return
         ip = self.widget_to_image(event.position())
         if ip is None:
@@ -235,6 +369,17 @@ class RefineCanvas(QWidget):
         self.page.stroke_start(ip)
 
     def mouseMoveEvent(self, event):
+        if self._panning:
+            t = self._transform()
+            if t is not None:
+                s = t[0]
+                d = event.position() - self._pan_start_widget
+                self._center_img = QPointF(
+                    self._pan_start_center.x() - d.x() / s,
+                    self._pan_start_center.y() - d.y() / s)
+                self._fast = True
+                self.update()
+            return
         ip = self.widget_to_image(event.position())
         if ip is None:
             return
@@ -245,6 +390,14 @@ class RefineCanvas(QWidget):
             self.update()
 
     def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MiddleButton or (
+                event.button() == Qt.LeftButton and self._panning):
+            self._panning = False
+            self._fast = False
+            self.setCursor(Qt.OpenHandCursor if self._space_held
+                           else Qt.ArrowCursor)
+            self.update()
+            return
         if event.button() == Qt.LeftButton and self._drawing:
             self._drawing = False
             self.page.stroke_end()
@@ -344,6 +497,7 @@ class FrameRefinePage(QWidget):
         self.cur_key: Optional[str] = None
         self.work: Optional[np.ndarray] = None      # 当前工作图（=state.work 引用）
         self._last_pt: Optional[Tuple[float, float]] = None
+        self._stroke_moved = False
         self._file_sig: str = ""
 
         # 工具参数
@@ -388,7 +542,7 @@ class FrameRefinePage(QWidget):
         self.canvas = RefineCanvas(self)
         wl.addWidget(self.canvas, 1)
 
-        hint = QLabel("提示：左键拖动涂抹；Ctrl+Z 撤销本张操作；[ 和 ] 调整笔刷大小")
+        hint = QLabel("提示：左键拖动涂抹；滚轮缩放（以光标为中心）；中键或空格+左键拖动平移；双击适应窗口；Ctrl+Z 撤销；[ ] 调笔刷")
         hint.setStyleSheet("color:#7f8c8d;font-size:12px;")
         wl.addWidget(hint)
 
@@ -699,6 +853,7 @@ class FrameRefinePage(QWidget):
             return
         self.work = st.work
         self.canvas.rebuild_scene(smooth=True)
+        self.canvas.reset_view()
         idx = self.items.index(it) + 1
         self.pos_label.setText(f"{idx} / {len(self.items)}  {it['key']}")
         self._refresh_cells()
@@ -766,10 +921,12 @@ class FrameRefinePage(QWidget):
         if st is None:
             return
         st.stroke_begin()
+        self._stroke_moved = False
         self._last_pt = pt
         self._apply_at(pt)
 
     def stroke_apply(self, pt: Tuple[float, float], smooth: bool = False):
+        self._stroke_moved = True
         if self._last_pt is None:
             self._apply_at(pt)
         else:
