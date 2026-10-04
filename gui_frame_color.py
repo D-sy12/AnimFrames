@@ -371,10 +371,10 @@ class FrameColorPage(QWidget):
         root.setContentsMargins(8, 8, 8, 8)
         root.setSpacing(8)
 
-        # ===== 左侧：上下两个显示区 =====
-        left_box = QGroupBox("矫色预览（上：抠好的图片 / 下：颜色参考基板原图）")
+        # ===== 左侧：左右两个显示区 =====
+        left_box = QGroupBox("矫色预览（左：抠好的图片 / 右：颜色参考基板原图）")
         lv = QVBoxLayout(left_box)
-        splitter = QSplitter(Qt.Vertical)
+        splitter = QSplitter(Qt.Horizontal)
         splitter.setStyleSheet("QSplitter{background:#2b2b2b;}")
 
         top_group = QGroupBox("抠好的图片（矫色对象，棋盘格=透明）")
