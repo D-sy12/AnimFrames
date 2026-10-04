@@ -153,9 +153,37 @@ def despill_edges(bgr: np.ndarray, alpha: np.ndarray,
     return out
 
 
+def decontaminate_edges(bgr: np.ndarray, alpha: np.ndarray,
+                        bg_bgr: np.ndarray, strength: float,
+                        a_floor: float = 0.03) -> np.ndarray:
+    """
+    边缘净化：半透明边缘像素的观察色是 alpha 合成的结果
+        C = a*F + (1-a)*B   （F 真实前景色，B 已知背景色）
+    已知 alpha 和 B 即可反解真实前景色：F = (C - (1-a)*B) / a。
+    与"去溢色"只压背景色主导分量不同，本操作按合成原理把混入的
+    背景色整体扣除，对深色、浅色、三分量接近的背景都有效。
+    alpha < a_floor 的像素反解数值不稳定，保持原色（视觉贡献可忽略）。
+    strength: 0.0~2.0（100%=完全反解，>100% 过度外推用于顽固色边）。
+    """
+    if strength <= 0:
+        return bgr
+    a = alpha.astype(np.float32) / 255.0
+    semi = a >= a_floor
+    if not semi.any():
+        return bgr
+    src = bgr.astype(np.float32)
+    af = np.maximum(a, 1e-3)[..., None]
+    est = (src - (1.0 - af) * bg_bgr) / af      # 反解前景色
+    est = np.clip(est, 0.0, 255.0)
+    out = src + (est - src) * strength          # 按强度向净色靠拢
+    out = np.where(semi[..., None], out, src)
+    return np.clip(out, 0.0, 255.0).astype(np.uint8)
+
+
 def matte_bgcolor_array(bgr: np.ndarray, colors: list, tol: float,
                         feather: int, choke: int, despill_pct: int,
-                        protect_inner: bool) -> np.ndarray:
+                        protect_inner: bool,
+                        edge_clean_pct: int = 0) -> np.ndarray:
     """
     色键抠像流水线（多背景色），输入 BGR 图像，返回 BGRA 结果。
       1. 像素到最近背景色的 RGB 距离 + 软阈值
@@ -163,14 +191,27 @@ def matte_bgcolor_array(bgr: np.ndarray, colors: list, tol: float,
       3. 边缘收缩(choke)：alpha 向内收 N px，吃掉主体边缘残留色边
       4. 羽化：高斯柔化收缩后的硬边
       5. 去溢色(despill)：中和边缘的背景色晕（可 >100% 加强压制）
+      6. 边缘净化(clean)：按 alpha 合成公式反解半透明像素的真实前景色
     worker 批量处理与界面实时预览共用此函数。
     """
-    # 1) 每个像素到所有背景色的距离，取最小值
+    need_clean = edge_clean_pct > 0 and bool(colors)
+
+    # 1) 每个像素到所有背景色的距离，取最小值；
+    #    边缘净化开启时同时记录每像素命中的背景色（距离最近者）
     dist = None
+    best_bg = np.empty(bgr.shape, np.float32) if need_clean else None
     for r, g, b in colors:
-        diff = bgr.astype(np.float32) - np.array([b, g, r], np.float32)
-        d = np.linalg.norm(diff, axis=2)
-        dist = d if dist is None else np.minimum(dist, d)
+        bgv = np.array([b, g, r], np.float32)
+        d = np.linalg.norm(bgr.astype(np.float32) - bgv, axis=2)
+        if dist is None:
+            dist = d
+            if need_clean:
+                best_bg[:] = bgv
+        else:
+            m = d < dist
+            dist = np.minimum(dist, d)
+            if need_clean:
+                best_bg[m] = bgv
 
     # 软阈值：0.75*tol 内全透明，tol 外全不透明，中间线性渐变
     inner = tol * 0.75
@@ -199,6 +240,11 @@ def matte_bgcolor_array(bgr: np.ndarray, colors: list, tol: float,
 
     # 5) 去溢色：中和边缘的绿边/蓝边
     bgr = despill_edges(bgr, alpha, colors, despill_pct / 100.0)
+
+    # 6) 边缘净化：反解半透明像素的真实前景色，整体扣除混入的背景色
+    if need_clean:
+        bgr = decontaminate_edges(bgr, alpha, best_bg,
+                                  edge_clean_pct / 100.0)
 
     out = cv2.cvtColor(bgr, cv2.COLOR_BGR2BGRA)
     out[:, :, 3] = alpha
@@ -276,6 +322,7 @@ class MattingWorker(QThread):
             choke=int(self.params.get("choke", 1)),
             despill_pct=int(self.params.get("despill", 80)),
             protect_inner=bool(self.params.get("protect_inner", True)),
+            edge_clean_pct=int(self.params.get("edge_clean", 0)),
         )
 
         os.makedirs(os.path.dirname(dst), exist_ok=True)
@@ -583,7 +630,7 @@ class FrameMattingPage(QWidget):
 
         # 模式参数（堆叠切换）
         self.params_stack = QStackedWidget()
-        self.params_stack.setMaximumHeight(262)
+        self.params_stack.setMaximumHeight(294)
 
         # 背景色抠图参数页
         bg_page = QWidget()
@@ -663,6 +710,19 @@ class FrameMattingPage(QWidget):
         despill_row.addWidget(self.despill_slider, 1)
         despill_row.addWidget(self.despill_label)
         bgl.addLayout(despill_row)
+
+        clean_row = QHBoxLayout()
+        clean_row.addWidget(QLabel("边缘净化:"))
+        self.clean_slider = QSlider(Qt.Horizontal)
+        self.clean_slider.setRange(0, 200)
+        self.clean_slider.setValue(100)
+        self.clean_label = QLabel("100%")
+        self.clean_label.setMinimumWidth(34)
+        self.clean_slider.valueChanged.connect(
+            lambda v: self.clean_label.setText(f"{v}%"))
+        clean_row.addWidget(self.clean_slider, 1)
+        clean_row.addWidget(self.clean_label)
+        bgl.addLayout(clean_row)
 
         opt_row = QHBoxLayout()
         self.chk_protect_inner = QCheckBox("保护主体内部同色（防误删）")
@@ -833,7 +893,8 @@ class FrameMattingPage(QWidget):
 
         # 参数变化 → 实时预览（80ms 防抖）
         for _s in (self.tol_slider, self.feather_slider,
-                   self.choke_slider, self.despill_slider):
+                   self.choke_slider, self.despill_slider,
+                   self.clean_slider):
             _s.valueChanged.connect(self._schedule_preview)
         self.chk_protect_inner.toggled.connect(self._schedule_preview)
 
@@ -1078,6 +1139,7 @@ class FrameMattingPage(QWidget):
                     choke=int(self.choke_slider.value()),
                     despill_pct=int(self.despill_slider.value()),
                     protect_inner=bool(self.chk_protect_inner.isChecked()),
+                    edge_clean_pct=int(self.clean_slider.value()),
                 )
 
         if bgra is not None:
@@ -1285,6 +1347,7 @@ class FrameMattingPage(QWidget):
             "feather": self.feather_slider.value(),
             "choke": self.choke_slider.value(),
             "despill": self.despill_slider.value(),
+            "edge_clean": self.clean_slider.value(),
             "protect_inner": self.chk_protect_inner.isChecked(),
         }
 
