@@ -29,7 +29,7 @@ from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QPushButton,
     QSlider, QScrollArea, QGroupBox, QRadioButton, QButtonGroup,
-    QCheckBox, QFrame, QSplitter,
+    QCheckBox, QFrame, QSplitter, QFileDialog, QMessageBox,
 )
 
 from gui_frame_matting import (
@@ -339,6 +339,8 @@ class FrameColorPage(QWidget):
         self.cells: List[ColorCell] = []
         self.cur_key: Optional[str] = None
         self.board_key: Optional[str] = None
+        self.board_mode = "frame"          # "frame"=取自帧 / "custom"=用户上传
+        self.board_custom_path = ""        # 上传基板在 colored 目录内的副本
         self._batch_id = ""
         self._batch_mark: Optional[float] = None
         self.worker: Optional[ColorWorker] = None
@@ -428,6 +430,11 @@ class FrameColorPage(QWidget):
         self.board_name.setWordWrap(True)
         self.board_name.setStyleSheet("color:#f1c40f;font-size:12px;")
         bl.addWidget(self.board_name)
+        btn_upload = QPushButton("📁 上传基板图…")
+        btn_upload.setToolTip("选择外部图片作为全部图片的颜色参考基准\n"
+                              "（副本保存在输出目录，随批次保留）")
+        btn_upload.clicked.connect(self._upload_board_dialog)
+        bl.addWidget(btn_upload)
         brow = QHBoxLayout()
         btn_set_board = QPushButton("当前图设为基板")
         btn_set_board.clicked.connect(self._set_board_current)
@@ -436,7 +443,8 @@ class FrameColorPage(QWidget):
         brow.addWidget(btn_set_board)
         brow.addWidget(btn_first_board)
         bl.addLayout(brow)
-        tip = QLabel("统计基于基板图抠好后的主体像素，背景色不参与；\n"
+        tip = QLabel("可上传任意外部图片作为颜色基准，或用下方按钮选某一帧；\n"
+                     "统计只取主体像素（上传的无透明通道图片整幅参与），\n"
                      "切换基板后所有图片以新基板为准")
         tip.setStyleSheet("color:#888;font-size:11px;")
         bl.addWidget(tip)
@@ -595,7 +603,23 @@ class FrameColorPage(QWidget):
 
         # 恢复上次基板/方法/强度
         saved = self._read_info()
+        if batch_changed:
+            self.board_mode = "frame"
+            self.board_custom_path = ""
         saved_board = saved.get("board_key", "")
+        saved_mode = saved.get("board_mode", "frame")
+        saved_custom = saved.get("board_file", "")
+        if saved_mode == "custom" and saved_custom:
+            cand = os.path.join(self.colored_dir, saved_custom)
+            if os.path.isfile(cand) and self._load_bgra(cand) is not None:
+                self.board_mode = "custom"
+                self.board_custom_path = cand
+            else:
+                self.board_mode = "frame"
+                self.board_custom_path = ""
+        else:
+            self.board_mode = "frame"
+            self.board_custom_path = ""
         if saved.get("method") == "hist":
             self.rb_hist.setChecked(True)
         else:
@@ -603,13 +627,12 @@ class FrameColorPage(QWidget):
         st = int(saved.get("strength", 100))
         self.strength_slider.setValue(max(0, min(100, st)))
 
-        if self.board_key not in {it["key"] for it in self.items}:
-            self.board_key = saved_board if any(
-                it["key"] == saved_board for it in self.items) else (
+        keys = {it["key"] for it in self.items}
+        if self.board_key not in keys:
+            self.board_key = saved_board if saved_board in keys else (
                 self.items[0]["key"] if self.items else None)
-        if self.cur_key not in {it["key"] for it in self.items}:
-            self.cur_key = self.board_key if self.board_key else (
-                self.items[0]["key"] if self.items else None)
+        if self.cur_key not in keys:
+            self.cur_key = self.items[0]["key"] if self.items else None
 
         self._build_grid()
         self._open_current()
@@ -693,6 +716,8 @@ class FrameColorPage(QWidget):
     def _show_empty(self, text: str):
         self.items, self.cells = [], []
         self.cur_key = self.board_key = None
+        self.board_mode = "frame"
+        self.board_custom_path = ""
         self._src_img = self._board_img = self._preview_img = None
         self._batch_id = ""
         self.view_label.set_image(None)
@@ -749,7 +774,28 @@ class FrameColorPage(QWidget):
             self._refresh_cells()
             return
         self._src_img = self._load_bgra(self._source_path(it))
-        # 基板：主体用抠好的图统计，显示基板原图
+        self._apply_board()
+        idx = self.items.index(it) + 1
+        self.pos_label.setText(f"{idx} / {len(self.items)}  {it['key']}")
+        self._update_preview()
+        self._refresh_cells()
+        self._update_ops()
+
+    def _apply_board(self) -> bool:
+        """按 board_mode 载入基板统计图（BGRA）并刷新下方显示。
+        custom=用户上传图片（无透明通道则整幅作为主体参与统计）；
+        frame=某一帧抠好后的主体，下方显示该帧原图。"""
+        if self.board_mode == "custom" and self.board_custom_path:
+            img = self._load_bgra(self.board_custom_path)
+            if img is not None:
+                self._board_img = img
+                self.board_label.set_image(bgra_to_pixmap(img))
+                self.board_name.setText(
+                    "基板（上传）：" + os.path.basename(self.board_custom_path))
+                return True
+            # 副本丢失则回退帧模式
+            self.board_mode = "frame"
+            self.board_custom_path = ""
         board_item = self._item(self.board_key) if self.board_key else None
         if board_item is not None:
             self._board_img = self._load_bgra(
@@ -761,11 +807,11 @@ class FrameColorPage(QWidget):
                 bgr_to_pixmap(disp[:, :, :3]) if disp is not None else None)
             self.board_name.setText(
                 f"基板：{self.board_key}（第 {board_item['number']} 张）")
-        idx = self.items.index(it) + 1
-        self.pos_label.setText(f"{idx} / {len(self.items)}  {it['key']}")
-        self._update_preview()
-        self._refresh_cells()
-        self._update_ops()
+            return self._board_img is not None
+        self._board_img = None
+        self.board_label.set_image(None)
+        self.board_name.setText("基板：（未选择）")
+        return False
 
     def _schedule_preview(self, *args):
         if self._src_img is not None and self._board_img is not None:
@@ -832,29 +878,69 @@ class FrameColorPage(QWidget):
     def _set_board_current(self):
         if not self.cur_key:
             return
+        self.board_mode = "frame"
+        self.board_custom_path = ""
         self.board_key = self.cur_key
-        it = self._cur_item()
-        self.board_name.setText(
-            f"基板：{self.board_key}（第 {it['number']} 张）")
-        board_item = self._item(self.board_key)
-        if board_item is not None:
-            self._board_img = self._load_bgra(
-                self._source_path(board_item))
-            disp_path = board_item["orig"] or self._source_path(board_item)
-            disp = imread_unicode(disp_path)
-            self.board_label.set_image(
-                bgr_to_pixmap(disp[:, :, :3]) if disp is not None else None)
         self._write_info()
+        self._apply_board()
         self._schedule_preview()
 
     def _reset_board_first(self):
         if not self.items:
             return
-        first_key = self.items[0]["key"]
-        if first_key != self.board_key:
-            self.board_key = first_key
-            self._write_info()
-            self._open_current()
+        self.board_mode = "frame"
+        self.board_custom_path = ""
+        self.board_key = self.items[0]["key"]
+        self._write_info()
+        self._apply_board()
+        self._schedule_preview()
+
+    # ---------- 用户上传基板 ----------
+
+    def _upload_board_dialog(self):
+        if not self.items or not self.colored_dir:
+            QMessageBox.information(
+                self, "上传基板图",
+                "请先完成批量抠图并进入本页面后再上传基板图。")
+            return
+        path, _ = QFileDialog.getOpenFileName(
+            self, "选择基板图（颜色参考）", "",
+            "图片文件 (*.png *.jpg *.jpeg *.bmp *.webp *.tif *.tiff)")
+        if path:
+            self._load_custom_board(path)
+
+    def _load_custom_board(self, src_path: str) -> bool:
+        """把外部图片复制进输出目录并设为基板（随批次保留/清理）"""
+        img = self._load_bgra(src_path)
+        if img is None:
+            QMessageBox.warning(self, "上传基板图", f"无法读取图片：\n{src_path}")
+            return False
+        os.makedirs(self.colored_dir, exist_ok=True)
+        ext = os.path.splitext(src_path)[1].lower()
+        if ext not in (".png", ".jpg", ".jpeg", ".bmp", ".webp"):
+            ext = ".png"
+        dst_name = "_board_ref" + ext
+        dst_path = os.path.join(self.colored_dir, dst_name)
+        # 删掉旧的不同扩展名副本，避免恢复时读到两个
+        for old in os.listdir(self.colored_dir):
+            if os.path.splitext(old)[0] == "_board_ref" and old != dst_name:
+                try:
+                    os.remove(os.path.join(self.colored_dir, old))
+                except OSError:
+                    pass
+        try:
+            shutil.copyfile(src_path, dst_path)
+        except OSError:
+            # 复制失败则直接引用原路径（不落副本，重启后需重新上传）
+            dst_path = src_path
+            dst_name = os.path.basename(src_path)
+        self.board_mode = "custom"
+        self.board_custom_path = dst_path
+        self._write_info()
+        self._apply_board()
+        self._schedule_preview()
+        self.status_text(f"已使用上传基板图：{os.path.basename(src_path)}")
+        return True
 
     # ---------- 保存 ----------
 
@@ -871,7 +957,14 @@ class FrameColorPage(QWidget):
     def _write_info(self):
         os.makedirs(self.colored_dir, exist_ok=True)
         data = {
+            "board_mode": self.board_mode,
             "board_key": self.board_key or "",
+            "board_file": (os.path.basename(self.board_custom_path)
+                           if self.board_mode == "custom"
+                           and self.board_custom_path
+                           and os.path.dirname(
+                               os.path.abspath(self.board_custom_path))
+                           == os.path.abspath(self.colored_dir) else ""),
             "method": self._method(),
             "strength": self.strength_slider.value(),
             "files": [it["key"] for it in self.items
