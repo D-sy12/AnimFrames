@@ -165,6 +165,7 @@ class FrameSelectorPage(QWidget):
         self.frames: List[FrameItem] = []
         self.cells: List[ThumbCell] = []
         self.frames_dir: str = ""
+        self._frames_sig: str = ""   # 帧目录内容签名（换视频重抽时变化）
 
         self.play_timer = QTimer(self)
         self.play_timer.timeout.connect(self._next_play_frame)
@@ -182,11 +183,30 @@ class FrameSelectorPage(QWidget):
 
     def showEvent(self, event):
         super().showEvent(event)
-        # 切到此页面时，若有共享的帧目录且未加载，则自动加载
+        # 切到此页面时，若有共享的帧目录：路径变化或同目录被重新抽帧都要重载
         d = self.shared_state.get("frames_dir", "")
-        if d and os.path.isdir(d) and d != self.frames_dir:
-            self.dir_edit.setText(d)
-            self._load_frames(d)
+        if d and os.path.isdir(d):
+            sig = self._frames_signature(d)
+            if d != self.frames_dir or sig != self._frames_sig:
+                self.dir_edit.setText(d)
+                self._load_frames(d)
+
+    @staticmethod
+    def _frames_signature(directory: str) -> str:
+        """帧目录内容签名：优先 frames_info.json 修改时间，否则用文件名清单"""
+        info_path = os.path.join(directory, "frames_info.json")
+        if os.path.isfile(info_path):
+            try:
+                return f"info:{os.path.getmtime(info_path):.3f}"
+            except OSError:
+                pass
+        exts = (".png", ".jpg", ".jpeg", ".bmp", ".webp")
+        try:
+            return "files:" + "|".join(
+                sorted(f for f in os.listdir(directory)
+                       if f.lower().endswith(exts)))
+        except OSError:
+            return ""
 
     def _build_ui(self):
         self.setStyleSheet("QGroupBox{border:none;margin-top:8px;} QGroupBox::title{subcontrol-origin:margin;left:8px;padding:0 4px;}")
@@ -357,6 +377,7 @@ class FrameSelectorPage(QWidget):
 
     def _load_frames(self, directory: str):
         self.frames_dir = directory
+        self._frames_sig = self._frames_signature(directory)
         # 手动加载的目录也同步给后续模块（抠图/色调/导出）
         self.shared_state["frames_dir"] = os.path.abspath(directory)
         self.frames = []

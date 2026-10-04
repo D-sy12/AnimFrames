@@ -506,7 +506,8 @@ class FrameMattingPage(QWidget):
         return sorted(i for i in self.selected if 0 <= i < len(self.frames))
 
     def _refresh_selection(self):
-        self.selected = self._read_selected()
+        n = len(self.frames)
+        self.selected = {i for i in self._read_selected() if 0 <= i < n}
         self._update_sel_label()
         # 网格是选中帧的实时镜像，选择变化时整体重建
         self._build_grid()
@@ -874,7 +875,9 @@ class FrameMattingPage(QWidget):
             self.frames.append(FrameRef(i, fn, os.path.join(directory, fn)))
 
         # 读取帧数选择页的选中列表（shared_state 优先，json 回退）
-        self.selected = self._read_selected()
+        # 过滤越界索引：换视频重抽后帧数可能变少，旧选中索引会超出新帧范围
+        self.selected = {i for i in self._read_selected()
+                         if 0 <= i < len(self.frames)}
 
         # 扫描已有抠图结果
         if os.path.isdir(self.output_dir):
