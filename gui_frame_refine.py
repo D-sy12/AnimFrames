@@ -523,28 +523,8 @@ class FrameRefinePage(QWidget):
         work_box = QGroupBox("精抠工作区（棋盘格=透明）")
         wl = QVBoxLayout(work_box)
 
-        nav_row = QHBoxLayout()
-        btn_prev = QPushButton("⏮ 上一张")
-        btn_next = QPushButton("下一张 ⏭")
-        btn_prev.clicked.connect(self._prev_image)
-        btn_next.clicked.connect(self._next_image)
-        nav_row.addWidget(btn_prev)
-        nav_row.addWidget(btn_next)
-        self.pos_label = QLabel("- / -")
-        self.pos_label.setStyleSheet("color:#888;")
-        nav_row.addWidget(self.pos_label)
-        nav_row.addStretch()
-        self.state_label = QLabel("")
-        self.state_label.setStyleSheet("color:#2ecc71;")
-        nav_row.addWidget(self.state_label)
-        wl.addLayout(nav_row)
-
         self.canvas = RefineCanvas(self)
         wl.addWidget(self.canvas, 1)
-
-        hint = QLabel("提示：左键拖动涂抹；滚轮缩放（以光标为中心）；中键或空格+左键拖动平移；双击适应窗口；Ctrl+Z 撤销；[ ] 调笔刷")
-        hint.setStyleSheet("color:#7f8c8d;font-size:12px;")
-        wl.addWidget(hint)
 
         root.addWidget(work_box, 13)
 
@@ -553,6 +533,30 @@ class FrameRefinePage(QWidget):
         rlay = QVBoxLayout(right_panel)
         rlay.setContentsMargins(0, 0, 0, 0)
         rlay.setSpacing(8)
+
+        # --- 图片导航（从左侧工作区移入） ---
+        nav_box = QGroupBox("图片导航")
+        nv = QVBoxLayout(nav_box)
+        nv.setSpacing(4)
+        nav_row = QHBoxLayout()
+        btn_prev = QPushButton("⏮ 上一张")
+        btn_next = QPushButton("下一张 ⏭")
+        btn_prev.clicked.connect(self._prev_image)
+        btn_next.clicked.connect(self._next_image)
+        nav_row.addWidget(btn_prev)
+        nav_row.addWidget(btn_next)
+        nav_row.addStretch()
+        nv.addLayout(nav_row)
+        pos_row = QHBoxLayout()
+        self.pos_label = QLabel("- / -")
+        self.pos_label.setStyleSheet("color:#888;")
+        pos_row.addWidget(self.pos_label)
+        pos_row.addStretch()
+        self.state_label = QLabel("")
+        self.state_label.setStyleSheet("color:#2ecc71;")
+        pos_row.addWidget(self.state_label)
+        nv.addLayout(pos_row)
+        rlay.addWidget(nav_box, 0)
 
         # --- 数据源/输出 ---
         dir_box = QGroupBox("图片来源")
@@ -654,11 +658,12 @@ class FrameRefinePage(QWidget):
         ol.addLayout(save_row)
         rlay.addWidget(op_box, 0)
 
-        right_scroll = QScrollArea()
-        right_scroll.setWidgetResizable(True)
-        right_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        right_scroll.setStyleSheet("QScrollArea{background:#2b2b2b;border:none;}")
-        rlay.addWidget(right_scroll, 1)
+        # 操作提示（从左侧工作区底部移入）
+        hint = QLabel("提示：左键拖动涂抹；滚轮缩放（以光标为中心）；中键或空格+左键拖动平移；双击适应窗口；Ctrl+Z 撤销；[ ] 调笔刷")
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color:#7f8c8d;font-size:11px;")
+        rlay.addWidget(hint, 0)
+        rlay.addStretch(1)
 
         # --- 下半：精抠图片网格 ---
         self.grid_group = QGroupBox("精抠图片")
