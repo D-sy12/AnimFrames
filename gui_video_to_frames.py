@@ -374,6 +374,7 @@ class VideoToFramesPage(QWidget):
         # 让批量抠图、图片精抠页进入时重新加载为空状态
         self.shared_state.pop("matted_dir", None)
         self.shared_state.pop("refined_dir", None)
+        self.shared_state.pop("colored_dir", None)
         self.frames_extracted.emit(output_dir)
 
     def _on_failed(self, err: str):
