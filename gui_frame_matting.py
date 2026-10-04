@@ -504,41 +504,6 @@ class FrameMattingPage(QWidget):
         rlay.setContentsMargins(0, 0, 0, 0)
         rlay.setSpacing(8)
 
-        # --- 预览导航（从左侧工作区移入） ---
-        nav_box = QGroupBox("预览导航")
-        nv = QVBoxLayout(nav_box)
-        nv.setSpacing(4)
-        nav_row = QHBoxLayout()
-        btn_prev = QPushButton("⏮ 上一帧")
-        btn_prev.clicked.connect(self._prev_frame)
-        nav_row.addWidget(btn_prev)
-
-        btn_next = QPushButton("⏭ 下一帧")
-        btn_next.clicked.connect(self._next_frame)
-        nav_row.addWidget(btn_next)
-
-        self.pos_label = QLabel("- / -")
-        self.pos_label.setStyleSheet("color:#888;")
-        nav_row.addWidget(self.pos_label)
-        nav_row.addStretch()
-        nv.addLayout(nav_row)
-
-        view_row = QHBoxLayout()
-        view_row.addWidget(QLabel("显示:"))
-        self.view_group = QButtonGroup(self)
-        self.rb_view_orig = QRadioButton("原图")
-        self.rb_view_result = QRadioButton("抠图结果")
-        self.rb_view_result.setChecked(True)
-        self.view_group.addButton(self.rb_view_orig)
-        self.view_group.addButton(self.rb_view_result)
-        self.rb_view_orig.toggled.connect(self._show_current)
-        self.rb_view_result.toggled.connect(self._show_current)
-        view_row.addWidget(self.rb_view_orig)
-        view_row.addWidget(self.rb_view_result)
-        view_row.addStretch()
-        nv.addLayout(view_row)
-        rlay.addWidget(nav_box, 0)
-
         # --- 帧目录 ---
         dir_box = QGroupBox("帧目录")
         dl = QHBoxLayout(dir_box)
@@ -730,6 +695,41 @@ class FrameMattingPage(QWidget):
         el.addLayout(btn_open_row)
 
         rlay.addWidget(exec_box, 0)
+
+        # --- 预览导航（紧邻待抠图帧网格） ---
+        nav_box = QGroupBox("预览导航")
+        nv = QVBoxLayout(nav_box)
+        nv.setSpacing(4)
+        nav_row = QHBoxLayout()
+        btn_prev = QPushButton("⏮ 上一帧")
+        btn_prev.clicked.connect(self._prev_frame)
+        nav_row.addWidget(btn_prev)
+
+        btn_next = QPushButton("⏭ 下一帧")
+        btn_next.clicked.connect(self._next_frame)
+        nav_row.addWidget(btn_next)
+
+        self.pos_label = QLabel("- / -")
+        self.pos_label.setStyleSheet("color:#888;")
+        nav_row.addWidget(self.pos_label)
+        nav_row.addStretch()
+        nv.addLayout(nav_row)
+
+        view_row = QHBoxLayout()
+        view_row.addWidget(QLabel("显示:"))
+        self.view_group = QButtonGroup(self)
+        self.rb_view_orig = QRadioButton("原图")
+        self.rb_view_result = QRadioButton("抠图结果")
+        self.rb_view_result.setChecked(True)
+        self.view_group.addButton(self.rb_view_orig)
+        self.view_group.addButton(self.rb_view_result)
+        self.rb_view_orig.toggled.connect(self._show_current)
+        self.rb_view_result.toggled.connect(self._show_current)
+        view_row.addWidget(self.rb_view_orig)
+        view_row.addWidget(self.rb_view_result)
+        view_row.addStretch()
+        nv.addLayout(view_row)
+        rlay.addWidget(nav_box, 0)
 
         # --- 图片存放区（抠图结果网格） ---
         self.grid_box = QGroupBox("待抠图帧（与帧数选择实时同步）")
