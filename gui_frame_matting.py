@@ -319,6 +319,7 @@ class MattedCell(QFrame):
         self.index = index
         self.source_path = source_path
         self._done = result_path is not None
+        self._current = False
 
         self.setFrameShape(QFrame.StyledPanel)
         self.setFixedWidth(thumb_w + 14)
@@ -371,8 +372,25 @@ class MattedCell(QFrame):
     def is_done(self) -> bool:
         return self._done
 
+    def set_current(self, cur: bool):
+        if cur != self._current:
+            self._current = cur
+            self._update_style()
+
+    def is_current(self) -> bool:
+        return self._current
+
     def _update_style(self):
-        if self._done:
+        if self._current:
+            # 当前工作区显示的帧：黄色边框（优先级最高，无论是否已抠图）
+            self.setStyleSheet(
+                "QFrame{border: 3px solid #f1c40f; border-radius: 4px; "
+                "background: #4a3d12;}")
+            mark = "● " if self._done else ""
+            self.caption.setText(f"{mark}#{self.index + 1}")
+            self.caption.setStyleSheet(
+                "font-size: 10px; color: #f1c40f; font-weight: bold;")
+        elif self._done:
             # 已抠图：绿色边框 + ✓
             self.setStyleSheet(
                 "QFrame{border: 3px solid #27ae60; border-radius: 4px; "
@@ -388,6 +406,13 @@ class MattedCell(QFrame):
             self.caption.setText(f"#{self.index + 1}")
             self.caption.setStyleSheet(
                 "font-size: 10px; color: #5dade2; font-weight: bold;")
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton:
+            self.clicked.emit(self.index)
+            event.accept()
+        else:
+            super().mousePressEvent(event)
 
 
 # ===================== 页面：批量抠图 =====================
@@ -905,6 +930,7 @@ class FrameMattingPage(QWidget):
 
         # 加载原图（取色用）
         self.cur_image = QImage(item.filepath)
+        self._refresh_current_cell()
 
         # 背景色模式 + 结果视图：用当前参数实时抠图预览（不落盘）
         live = (self.rb_view_result.isChecked()
@@ -1379,10 +1405,16 @@ class FrameMattingPage(QWidget):
         item = self.frames[idx]
         result = self.results.get(idx)   # 有结果显示结果，否则显示原图（待处理）
         cell = MattedCell(idx, item.filepath, result)
+        cell.set_current(idx == self.cur_index)
         cell.clicked.connect(self._on_cell_click)
         r, c = divmod(pos, self._grid_cols())
         self.grid.addWidget(cell, r, c)
         self.cells.append(cell)
+
+    def _refresh_current_cell(self):
+        """用黄色边框标记工作区当前显示的帧，其余格子恢复蓝/绿"""
+        for cell in self.cells:
+            cell.set_current(cell.index == self.cur_index)
 
     def _on_cell_click(self, idx: int):
         self.cur_index = idx
@@ -1397,7 +1429,7 @@ class FrameMattingPage(QWidget):
         n_sel = len(self.selected)
         done = len(self.selected & set(self.results))
         self.grid_box.setTitle(
-            f"待抠图帧（与帧数选择实时同步  |  蓝框=待处理，绿框✓=已抠图）  "
+            f"待抠图帧（点击跳转  |  黄框=当前，蓝框=待处理，绿框✓=已抠图）  "
             f"已完成 {done} / {n_sel}")
 
     def _update_sel_label(self):
