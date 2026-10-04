@@ -36,8 +36,68 @@ from PySide6.QtWidgets import (
 )
 
 import export_utils as eu
-from gui_frame_matting import imwrite_unicode
+from gui_frame_matting import imwrite_unicode, compose_checkerboard
 from gui_frame_color import FitImageLabel, bgra_to_pixmap
+
+
+# ===================== 可交互工作台画布 =====================
+
+class WorkspaceCanvas(FitImageLabel):
+    """PS 式工作台：记录显示区域，把鼠标拖拽换算成全分辨率画布坐标增量"""
+
+    drag_delta = Signal(float, float)    # (dx, dy) 全分辨率画布像素
+    drag_finished = Signal()
+
+    def __init__(self, checker: bool = True):
+        super().__init__(checker)
+        self._disp_rect = None           # 图像在控件中的显示矩形
+        self.canvas_wh = (1, 1)          # 当前画布全分辨率宽高（换算用）
+        self._last = None
+        self.tool = "move"               # "move" / "scale"
+        self.setCursor(Qt.OpenHandCursor)
+
+    def set_tool(self, tool: str):
+        self.tool = tool
+        self.setCursor(Qt.OpenHandCursor if tool == "move"
+                       else Qt.SizeAllCursor)
+
+    def _render(self):
+        if self._pix is None or self._pix.isNull():
+            self._disp_rect = None
+            self.clear()
+            return
+        scaled = self._pix.scaled(self.size(), Qt.KeepAspectRatio,
+                                  Qt.SmoothTransformation)
+        x = (self.width() - scaled.width()) // 2
+        y = (self.height() - scaled.height()) // 2
+        self._disp_rect = (x, y, scaled.width(), scaled.height())
+        self.setPixmap(compose_checkerboard(scaled)
+                       if self._checker else scaled)
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.LeftButton and self._disp_rect:
+            self._last = e.position()
+            self.setCursor(Qt.ClosedHandCursor if self.tool == "move"
+                           else Qt.SizeAllCursor)
+        super().mousePressEvent(e)
+
+    def mouseMoveEvent(self, e):
+        if self._last is not None and self._disp_rect:
+            pos = e.position()
+            dx, dy = pos.x() - self._last.x(), pos.y() - self._last.y()
+            self._last = pos
+            dw = self._disp_rect[2]
+            if dw > 0:
+                f = self.canvas_wh[0] / dw     # 等比缩放，fx=fy
+                self.drag_delta.emit(dx * f, dy * f)
+        super().mouseMoveEvent(e)
+
+    def mouseReleaseEvent(self, e):
+        if self._last is not None:
+            self._last = None
+            self.set_tool(self.tool)
+            self.drag_finished.emit()
+        super().mouseReleaseEvent(e)
 
 
 # ===================== 导出工作线程 =====================
@@ -97,9 +157,7 @@ class _ExportWorker(QThread):
 
     def _run_psd(self):
         p = self.params
-        sizes = [(it["w"], it["h"]) for it in self.items]
-        cw = max(w for w, h in sizes)
-        ch = max(h for w, h in sizes)
+        cw, ch = p["canvas_wh"]
         layers = []
         composite = np.zeros((ch, cw, 4), np.uint8)
         for i, it in enumerate(self.items, 1):
@@ -107,6 +165,9 @@ class _ExportWorker(QThread):
             pct = p["layer_scales"].get(it["key"], 100)
             sim = eu.scale_bgra(img, pct / 100.0)
             x, y = eu.centered_xy(cw, ch, sim.shape[1], sim.shape[0])
+            ox, oy = p["layer_offsets"].get(it["key"], (0.0, 0.0))
+            x += int(round(ox))
+            y += int(round(oy))
             name = os.path.splitext(it["key"])[0][:80]
             vis = self._visible(it)
             layers.append((name, sim, x, y, vis))
@@ -282,12 +343,11 @@ class FrameExportPage(QWidget):
         self.layer_rows: List[LayerRow] = []
         self._layer_scales: Dict[str, int] = {}
         self._layer_visible: Dict[str, bool] = {}
+        self._layer_offsets: Dict[str, List[float]] = {}   # 相对居中偏移
         self.loader: Optional[_PreviewLoader] = None
         self.worker: Optional[_ExportWorker] = None
 
-        self._build_ui()
-
-        # 预览/持久化防抖
+        # 预览/持久化防抖（须在 _build_ui 前创建，画布连接用到）
         self._preview_timer = QTimer(self)
         self._preview_timer.setSingleShot(True)
         self._preview_timer.setInterval(90)
@@ -297,6 +357,8 @@ class FrameExportPage(QWidget):
         self._save_timer.setInterval(300)
         self._save_timer.timeout.connect(self._write_info)
 
+        self._build_ui()
+
     # ---------- UI ----------
 
     def _build_ui(self):
@@ -305,9 +367,11 @@ class FrameExportPage(QWidget):
         root.setSpacing(8)
 
         # ===== 左侧：PS 式工作台 =====
-        left_box = QGroupBox("工作台（棋盘格=透明，合成显示所有睁眼图层）")
+        left_box = QGroupBox("工作台（棋盘格=透明，选中图片后用工具拖拽）")
         lv = QVBoxLayout(left_box)
-        self.view = FitImageLabel(checker=True)
+        self.view = WorkspaceCanvas(checker=True)
+        self.view.drag_delta.connect(self._on_canvas_drag)
+        self.view.drag_finished.connect(self._save_timer.start)
         lv.addWidget(self.view, 1)
         self.info_label = QLabel("尚未加载图片")
         self.info_label.setStyleSheet("color:#f1c40f;font-size:12px;")
@@ -325,6 +389,65 @@ class FrameExportPage(QWidget):
         params_box = QGroupBox("导出参数")
         pv = QVBoxLayout(params_box)
         pv.setSpacing(6)
+
+        # 画布与工具
+        tool_box = QGroupBox("画布与工具")
+        tf = QVBoxLayout(tool_box)
+        tf.setSpacing(5)
+        rowt = QHBoxLayout()
+        rowt.addWidget(QLabel("工具："))
+        self.btn_tool_move = QToolButton()
+        self.btn_tool_move.setText("🖐 移动")
+        self.btn_tool_move.setCheckable(True)
+        self.btn_tool_move.setChecked(True)
+        self.btn_tool_move.setToolTip("选中图片后，在画布上拖拽移动位置")
+        self.btn_tool_scale = QToolButton()
+        self.btn_tool_scale.setText("⤢ 缩放")
+        self.btn_tool_scale.setCheckable(True)
+        self.btn_tool_scale.setToolTip("选中图片后，在画布上左右拖拽调整大小")
+        from PySide6.QtWidgets import QButtonGroup
+        self.tool_group = QButtonGroup(self)
+        self.tool_group.setExclusive(True)
+        self.tool_group.addButton(self.btn_tool_move)
+        self.tool_group.addButton(self.btn_tool_scale)
+        self.btn_tool_move.clicked.connect(
+            lambda: self.view.set_tool("move"))
+        self.btn_tool_scale.clicked.connect(
+            lambda: self.view.set_tool("scale"))
+        rowt.addWidget(self.btn_tool_move)
+        rowt.addWidget(self.btn_tool_scale)
+        btn_zero = QPushButton("位置归零")
+        btn_zero.setToolTip("选中图片回到画布中心")
+        btn_zero.clicked.connect(self._reset_selected_offset)
+        rowt.addWidget(btn_zero)
+        rowt.addStretch()
+        tf.addLayout(rowt)
+
+        rowc = QHBoxLayout()
+        self.chk_canvas_auto = QCheckBox("画板自动（取最大帧）")
+        self.chk_canvas_auto.setChecked(True)
+        rowc.addWidget(self.chk_canvas_auto)
+        rowc.addStretch()
+        rowc.addWidget(QLabel("宽"))
+        self.spn_cw = QSpinBox()
+        self.spn_cw.setRange(16, 16384)
+        self.spn_cw.setValue(1024)
+        self.spn_cw.setEnabled(False)
+        rowc.addWidget(self.spn_cw)
+        rowc.addWidget(QLabel("高"))
+        self.spn_ch = QSpinBox()
+        self.spn_ch.setRange(16, 16384)
+        self.spn_ch.setValue(1024)
+        self.spn_ch.setEnabled(False)
+        rowc.addWidget(self.spn_ch)
+        self.chk_canvas_auto.toggled.connect(
+            lambda on: (self.spn_cw.setEnabled(not on),
+                        self.spn_ch.setEnabled(not on)))
+        self.chk_canvas_auto.toggled.connect(self._on_setting_changed)
+        self.spn_cw.valueChanged.connect(self._on_setting_changed)
+        self.spn_ch.valueChanged.connect(self._on_setting_changed)
+        tf.addLayout(rowc)
+        pv.addWidget(tool_box)
 
         # 精灵图参数
         sprite_box = QGroupBox("精灵图 PNG")
@@ -639,6 +762,40 @@ class FrameExportPage(QWidget):
 
     # ---------- 设置 ----------
 
+    def _canvas_size(self) -> Tuple[int, int]:
+        """画板尺寸：自动=最大帧，否则取手动宽高"""
+        if not self.items:
+            return (self.spn_cw.value(), self.spn_ch.value())
+        if self.chk_canvas_auto.isChecked():
+            return (max(it["w"] for it in self.items),
+                    max(it["h"] for it in self.items))
+        return (self.spn_cw.value(), self.spn_ch.value())
+
+    def _on_canvas_drag(self, dx: float, dy: float):
+        """移动工具=拖动选中图层位置；缩放工具=横向拖拽调大小"""
+        key = self.selected_key
+        if not key:
+            return
+        if self.view.tool == "move":
+            ox, oy = self._layer_offsets.get(key, (0.0, 0.0))
+            self._layer_offsets[key] = [ox + dx, oy + dy]
+            self._schedule_preview()
+        else:
+            row = next((r for r in self.layer_rows if r.key == key), None)
+            if row is not None:
+                cur = row.spin.value()
+                new = max(5, min(400, int(round(cur + dx * 0.5))))
+                if new != cur:
+                    row.spin.setValue(new)   # 触发 changed → 预览+保存
+
+    def _reset_selected_offset(self):
+        key = self.selected_key
+        if key and key in self._layer_offsets:
+            del self._layer_offsets[key]
+            self._schedule_preview()
+            self._save_timer.start()
+            self.status_text(f"{key} 已回到画布中心")
+
     def _sprite_params(self) -> dict:
         return {
             "auto_columns": self.chk_auto_cols.isChecked(),
@@ -678,9 +835,9 @@ class FrameExportPage(QWidget):
                 f"{len(vis)}/{len(self.items)} 帧可见）")
         else:
             self.size_label.setText("输出尺寸：-（全部图层已隐藏）")
-        cw = max(it["w"] for it in self.items)
-        ch = max(it["h"] for it in self.items)
-        self.canvas_label.setText(f"画布尺寸：{cw} × {ch} px（每帧居中）")
+        cw, ch = self._canvas_size()
+        mode = "自动" if self.chk_canvas_auto.isChecked() else "手动"
+        self.canvas_label.setText(f"画布尺寸：{cw} × {ch} px（{mode}）")
 
     # ---------- 图层列表 ----------
 
@@ -759,12 +916,12 @@ class FrameExportPage(QWidget):
         return {k: v for k, v in self.preview_cache.items()}
 
     def _render_workspace(self):
-        """PS 式工作台：合成所有可见图层；无可见图层时显示选中层"""
+        """PS 式工作台：合成所有可见图层（含独立缩放与位置偏移）"""
         cache = self._ready_images()
         if not cache or not self.items:
             return
-        cw = max(it["w"] for it in self.items)
-        ch = max(it["h"] for it in self.items)
+        cw, ch = self._canvas_size()
+        self.view.canvas_wh = (cw, ch)
         # 预览用小图等比计算画布
         pf = min(1.0, self.PREVIEW_MAX / max(1.0, max(cw, ch)))
         pw = max(1, int(cw * pf))
@@ -780,15 +937,19 @@ class FrameExportPage(QWidget):
             pct = self._layer_scales.get(it["key"], 100) / 100.0
             sim = eu.scale_bgra(im, pct * pf)
             x, y = eu.centered_xy(pw, ph, sim.shape[1], sim.shape[0])
-            eu.flatten_over(canvas, sim, x, y)
+            ox, oy = self._layer_offsets.get(it["key"], (0.0, 0.0))
+            eu.flatten_over(canvas, sim,
+                            x + int(round(ox * pf)),
+                            y + int(round(oy * pf)))
             shown += 1
         self.view.set_image(bgra_to_pixmap(canvas))
         total = len(self.items)
         hidden = total - len(self._visible_items())
+        sel = self.selected_key or "-"
         self.info_label.setText(
-            f"工作台合成：{shown} 个可见图层"
+            f"工作台 {cw}×{ch}：{shown} 个可见图层"
             + (f"，{hidden} 个已隐藏" if hidden else "")
-            + f"（共 {total} 张）")
+            + f"｜选中：{sel}")
 
     def _render_sprite_preview(self):
         cache = self._ready_images()
@@ -826,6 +987,8 @@ class FrameExportPage(QWidget):
         params = self._sprite_params()
         params["layer_scales"] = dict(self._layer_scales)
         params["layer_visible"] = dict(self._layer_visible)
+        params["layer_offsets"] = dict(self._layer_offsets)
+        params["canvas_wh"] = self._canvas_size()
         self.worker = _ExportWorker(mode, self.items, params, out_path)
         self.worker.progress.connect(self.status_text)
         self.worker.failed.connect(self._on_export_failed)
@@ -884,6 +1047,9 @@ class FrameExportPage(QWidget):
                                             int(data.get("sprite_scale", 100)))))
         self.chk_sprite_preview.setChecked(
             bool(data.get("sprite_preview", False)))
+        self.chk_canvas_auto.setChecked(bool(data.get("canvas_auto", True)))
+        self.spn_cw.setValue(max(16, int(data.get("canvas_w", 1024))))
+        self.spn_ch.setValue(max(16, int(data.get("canvas_h", 1024))))
         keys = {it["key"] for it in self.items}
         saved_scales = data.get("layer_scales", {})
         self._layer_scales = {
@@ -892,6 +1058,11 @@ class FrameExportPage(QWidget):
         saved_vis = data.get("layer_visible", {})
         self._layer_visible = {k: bool(v)
                                for k, v in saved_vis.items() if k in keys}
+        saved_off = data.get("layer_offsets", {})
+        self._layer_offsets = {k: [float(v[0]), float(v[1])]
+                               for k, v in saved_off.items()
+                               if k in keys and isinstance(v, (list, tuple))
+                               and len(v) == 2}
 
     def _write_info(self):
         if not self.export_dir or not self.items:
@@ -903,8 +1074,12 @@ class FrameExportPage(QWidget):
             "padding": self.spn_pad.value(),
             "sprite_scale": self.spn_scale.value(),
             "sprite_preview": self.chk_sprite_preview.isChecked(),
+            "canvas_auto": self.chk_canvas_auto.isChecked(),
+            "canvas_w": self.spn_cw.value(),
+            "canvas_h": self.spn_ch.value(),
             "layer_scales": self._layer_scales,
             "layer_visible": self._layer_visible,
+            "layer_offsets": self._layer_offsets,
         }
         try:
             with open(self._info_path(), "w", encoding="utf-8") as f:
