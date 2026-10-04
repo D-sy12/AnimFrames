@@ -369,6 +369,11 @@ class VideoToFramesPage(QWidget):
         # 重新抽帧后旧的选中列表失效，清除避免后续模块读到残留索引
         self.shared_state.pop("selected_indices", None)
         self.shared_state.pop("selected_files", None)
+        self.shared_state.pop("selected_frames", None)
+        # 旧视频的抠图/精抠目录已在抽帧时删除，清除指向它们的路径，
+        # 让批量抠图、图片精抠页进入时重新加载为空状态
+        self.shared_state.pop("matted_dir", None)
+        self.shared_state.pop("refined_dir", None)
         self.frames_extracted.emit(output_dir)
 
     def _on_failed(self, err: str):

@@ -792,7 +792,10 @@ class FrameRefinePage(QWidget):
         self.cur_key = None
         self.work = None
         self._file_sig = ""
+        self.matted_dir = ""
+        self.refined_dir = ""
         self.canvas.rebuild_scene()
+        self.canvas.reset_view()
         self._build_grid()
         self.pos_label.setText("- / -")
         self.state_label.setText("")
