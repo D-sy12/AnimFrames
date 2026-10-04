@@ -15,6 +15,7 @@
 
 import os
 import json
+import shutil
 from typing import Optional, List, Dict, Tuple
 
 import numpy as np
@@ -498,7 +499,8 @@ class FrameRefinePage(QWidget):
         self.work: Optional[np.ndarray] = None      # 当前工作图（=state.work 引用）
         self._last_pt: Optional[Tuple[float, float]] = None
         self._stroke_moved = False
-        self._file_sig: str = ""
+        self._batch_id: str = ""     # 当前批次标识（帧目录+抠图目录及内容签名）
+        self._batch_mark = None      # 当前批次生成时间（matted_info mtime）
 
         # 工具参数
         self._tool = "erase"
@@ -719,7 +721,7 @@ class FrameRefinePage(QWidget):
         self._reload_if_changed()
 
     def _manual_reload(self):
-        self._file_sig = ""  # 强制重载
+        self._batch_id = ""  # 强制重载（仍按同批次处理：先落盘编辑）
         self._reload_if_changed(force=True)
 
     def _reload_if_changed(self, force: bool = False):
@@ -730,19 +732,31 @@ class FrameRefinePage(QWidget):
             return
         files = sorted(f for f in os.listdir(matted_dir)
                        if f.lower().endswith(".png"))
-        sig = matted_dir + "|" + "|".join(files)
-        if not force and sig == self._file_sig:
+        batch_id = self._batch_identity(frames_dir, matted_dir)
+        if not force and batch_id == self._batch_id:
             return
-        self._file_sig = sig
+        # 批次生成时间：早于它的 refined 文件都是上一批次的残留
+        # （兜底：极端情况下 rmtree 因文件被占用而静默失败）
+        self._batch_mark = self._batch_mtime(frames_dir, matted_dir)
 
-        # 切换图片前先保存当前修改
-        self._flush_current(show_msg=False)
-
-        self.matted_dir = matted_dir
-        self.frames_dir = frames_dir
-        self.refined_dir = os.path.join(
+        new_refined = os.path.join(
             frames_dir, "refined") if frames_dir else os.path.join(
                 os.path.dirname(matted_dir), "refined")
+        # 批次切换（换视频重抽 / 换帧目录 / 重新批量抠图）：
+        # 旧批次的内存编辑必须整体丢弃，绝不能 flush 回磁盘——
+        # 新旧帧同名（frame_00001.png ...）时旧精抠图会顶替/覆盖新帧
+        batch_changed = bool(self._batch_id) and self._batch_id != batch_id
+        if batch_changed:
+            self.states = {}
+            self._discard_stale_refined(self.refined_dir, new_refined)
+        else:
+            # 同批次刷新（手动重载）：重载前先保存当前修改
+            self._flush_current(show_msg=False)
+
+        self._batch_id = batch_id
+        self.matted_dir = matted_dir
+        self.frames_dir = frames_dir
+        self.refined_dir = new_refined
         os.makedirs(self.refined_dir, exist_ok=True)
 
         old_states = self.states
@@ -762,7 +776,8 @@ class FrameRefinePage(QWidget):
         self.src_label.setText(f"批量抠图结果：{matted_dir}")
         self.out_label.setText(f"精抠输出：{self.refined_dir}")
 
-        # 只保留未保存的内存编辑；已落盘的重新从磁盘加载（撤销栈重置）
+        # 当前图片仍在新批次中则保留定位；
+        # 未保存内存编辑仅同批次刷新时保留（批次切换时 old_states 已清空）
         self.cur_key = self.cur_key if any(
             it["key"] == self.cur_key for it in self.items) else None
         self.states = {k: v for k, v in old_states.items()
@@ -774,8 +789,78 @@ class FrameRefinePage(QWidget):
             self.cur_key = self.items[0]["key"]
         self._open_current()
         n_refined = sum(1 for it in self.items
-                        if os.path.isfile(it["refined"]))
+                        if self._is_current_refined(it["refined"]))
         self.status_text(f"已加载 {len(self.items)} 张，已精修 {n_refined} 张")
+
+    @staticmethod
+    def _batch_identity(frames_dir: str, matted_dir: str) -> str:
+        """批次标识：帧目录 + 抠图目录的路径与内容签名。
+        优先用 info json 修改时间（同目录重抽/重新批量抠图都会变），
+        回退为 PNG 文件名清单——两次抽帧数量相同、文件名完全相同也能区分。"""
+        def info_sig(d: str, info_name: str) -> str:
+            if not d:
+                return ""
+            info_path = os.path.join(d, info_name)
+            if os.path.isfile(info_path):
+                try:
+                    return f"info:{os.path.getmtime(info_path):.3f}"
+                except OSError:
+                    pass
+            try:
+                return "files:" + "|".join(sorted(
+                    f for f in os.listdir(d)
+                    if f.lower().endswith(".png")))
+            except OSError:
+                return ""
+
+        fdir = os.path.abspath(frames_dir) if frames_dir else ""
+        mdir = os.path.abspath(matted_dir)
+        return (f"{mdir}|{info_sig(mdir, 'matted_info.json')}|"
+                f"{fdir}|{info_sig(fdir, 'frames_info.json')}")
+
+    @staticmethod
+    def _batch_mtime(frames_dir: str,
+                     matted_dir: str) -> Optional[float]:
+        """批次生成时间：优先 matted_info.json，回退 frames_info.json"""
+        for d, name in ((matted_dir, "matted_info.json"),
+                        (frames_dir, "frames_info.json")):
+            if d:
+                p = os.path.join(d, name)
+                if os.path.isfile(p):
+                    try:
+                        return os.path.getmtime(p)
+                    except OSError:
+                        pass
+        return None
+
+    def _is_current_refined(self, path: str) -> bool:
+        """精抠文件是否属于当前批次：存在且不早于本批次生成时间。
+        换批次后即使有删不掉的旧文件残留（被占用致 rmtree 失败），
+        也不会被当成当前帧的精抠结果加载。"""
+        if not path or not os.path.isfile(path):
+            return False
+        if self._batch_mark is None:
+            return True
+        try:
+            return os.path.getmtime(path) >= self._batch_mark - 1e-6
+        except OSError:
+            return False
+
+    def _discard_stale_refined(self, old_refined: str, new_refined: str):
+        """批次切换时清掉磁盘上的旧精抠结果（仅当新旧精抠目录是同一路径）。
+        抽帧流程本身已 rmtree refined，这里兜底防止旧文件残留顶替新帧，
+        同时覆盖"同批帧重新批量抠图"后旧精抠结果失效的情况。
+        新旧目录不同（旧批次产物在别处仍保留）时绝不触碰旧目录。"""
+        if not old_refined or not new_refined:
+            return
+        if os.path.basename(os.path.normpath(old_refined)).lower() != "refined":
+            return
+        if os.path.abspath(old_refined) != os.path.abspath(new_refined):
+            return
+        shutil.rmtree(old_refined, ignore_errors=True)
+        if os.path.abspath(self.shared_state.get("refined_dir", "")) \
+                == os.path.abspath(old_refined):
+            self.shared_state["refined_dir"] = ""
 
     def _find_original(self, stem: str) -> Optional[str]:
         """按文件 stem 在原始帧目录找未抠图原图"""
@@ -791,7 +876,8 @@ class FrameRefinePage(QWidget):
         self.items, self.states, self.cells = [], {}, []
         self.cur_key = None
         self.work = None
-        self._file_sig = ""
+        self._batch_id = ""
+        self._batch_mark = None
         self.matted_dir = ""
         self.refined_dir = ""
         self.canvas.rebuild_scene()
@@ -813,8 +899,8 @@ class FrameRefinePage(QWidget):
         st = self.states.get(key)
         if st is not None:
             return st
-        # 优先读取已精修结果，其次批量抠图结果
-        base_path = item["refined"] if os.path.isfile(item["refined"]) \
+        # 优先读取本批次已精修结果，其次批量抠图结果
+        base_path = item["refined"] if self._is_current_refined(item["refined"]) \
             else item["matted"]
         base = imread_unicode(base_path)
         if base is None:
@@ -1076,7 +1162,7 @@ class FrameRefinePage(QWidget):
             "frames": [
                 {"index": it["number"], "filename": it["key"]}
                 for it in self.items
-                if os.path.isfile(it["refined"])
+                if self._is_current_refined(it["refined"])
             ],
         }
         try:
@@ -1107,7 +1193,7 @@ class FrameRefinePage(QWidget):
         cell_w = 124 + 6
         cols = max(1, avail // cell_w)
         for i, item in enumerate(self.items):
-            path = item["refined"] if os.path.isfile(item["refined"]) \
+            path = item["refined"] if self._is_current_refined(item["refined"]) \
                 else item["matted"]
             cell = RefineCell(item["key"], path)
             cell.clicked.connect(self._switch_to)
@@ -1117,7 +1203,7 @@ class FrameRefinePage(QWidget):
 
     def _refresh_cells(self):
         refined_keys = {it["key"] for it in self.items
-                        if os.path.isfile(it["refined"])}
+                        if self._is_current_refined(it["refined"])}
         for i, item in enumerate(self.items):
             if i >= len(self.cells):
                 continue
@@ -1142,7 +1228,7 @@ class FrameRefinePage(QWidget):
             if st.modified:
                 self.state_label.setText("● 有未保存修改")
                 self.state_label.setStyleSheet("color:#f39c12;")
-            elif os.path.isfile(st.refined_path):
+            elif self._is_current_refined(st.refined_path):
                 self.state_label.setText("✓ 已精修保存")
                 self.state_label.setStyleSheet("color:#2ecc71;")
             else:
