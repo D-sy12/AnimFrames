@@ -496,6 +496,18 @@ class FrameMattingPage(QWidget):
         self.preview_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         wl.addWidget(self.preview_label, 1)
 
+        self.h_layout.addWidget(work_box, 13)
+
+        # ===== 右侧面板 =====
+        right_panel = QWidget()
+        rlay = QVBoxLayout(right_panel)
+        rlay.setContentsMargins(0, 0, 0, 0)
+        rlay.setSpacing(8)
+
+        # --- 预览导航（从左侧工作区移入） ---
+        nav_box = QGroupBox("预览导航")
+        nv = QVBoxLayout(nav_box)
+        nv.setSpacing(4)
         nav_row = QHBoxLayout()
         btn_prev = QPushButton("⏮ 上一帧")
         btn_prev.clicked.connect(self._prev_frame)
@@ -509,8 +521,10 @@ class FrameMattingPage(QWidget):
         self.pos_label.setStyleSheet("color:#888;")
         nav_row.addWidget(self.pos_label)
         nav_row.addStretch()
+        nv.addLayout(nav_row)
 
-        nav_row.addWidget(QLabel("显示:"))
+        view_row = QHBoxLayout()
+        view_row.addWidget(QLabel("显示:"))
         self.view_group = QButtonGroup(self)
         self.rb_view_orig = QRadioButton("原图")
         self.rb_view_result = QRadioButton("抠图结果")
@@ -519,17 +533,11 @@ class FrameMattingPage(QWidget):
         self.view_group.addButton(self.rb_view_result)
         self.rb_view_orig.toggled.connect(self._show_current)
         self.rb_view_result.toggled.connect(self._show_current)
-        nav_row.addWidget(self.rb_view_orig)
-        nav_row.addWidget(self.rb_view_result)
-        wl.addLayout(nav_row)
-
-        self.h_layout.addWidget(work_box, 13)
-
-        # ===== 右侧面板 =====
-        right_panel = QWidget()
-        rlay = QVBoxLayout(right_panel)
-        rlay.setContentsMargins(0, 0, 0, 0)
-        rlay.setSpacing(8)
+        view_row.addWidget(self.rb_view_orig)
+        view_row.addWidget(self.rb_view_result)
+        view_row.addStretch()
+        nv.addLayout(view_row)
+        rlay.addWidget(nav_box, 0)
 
         # --- 帧目录 ---
         dir_box = QGroupBox("帧目录")
@@ -621,8 +629,8 @@ class FrameMattingPage(QWidget):
         choke_row.addWidget(QLabel("边缘收缩:"))
         self.choke_slider = QSlider(Qt.Horizontal)
         self.choke_slider.setRange(0, 4)
-        self.choke_slider.setValue(1)
-        self.choke_label = QLabel("1")
+        self.choke_slider.setValue(0)
+        self.choke_label = QLabel("0")
         self.choke_label.setMinimumWidth(30)
         self.choke_slider.valueChanged.connect(
             lambda v: self.choke_label.setText(str(v)))
