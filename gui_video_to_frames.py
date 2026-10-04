@@ -375,6 +375,7 @@ class VideoToFramesPage(QWidget):
         self.shared_state.pop("matted_dir", None)
         self.shared_state.pop("refined_dir", None)
         self.shared_state.pop("colored_dir", None)
+        self.shared_state.pop("export_dir", None)
         self.frames_extracted.emit(output_dir)
 
     def _on_failed(self, err: str):

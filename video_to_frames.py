@@ -115,9 +115,10 @@ def extract_frames(
             except OSError:
                 pass
 
-    # 清理下游模块产物（批量抠图 matted/、图片精抠 refined/、色调统一 colored/），
-    # 否则换新视频重新抽帧后，旧视频的产物会残留并被下游页面读到
-    for sub in ("matted", "refined", "colored"):
+    # 清理下游模块产物（批量抠图 matted/、图片精抠 refined/、色调统一
+    # colored/、导出 export/），否则换新视频重新抽帧后旧产物会残留并被
+    # 下游页面读到
+    for sub in ("matted", "refined", "colored", "export"):
         sub_dir = os.path.join(output_dir, sub)
         if os.path.isdir(sub_dir):
             shutil.rmtree(sub_dir, ignore_errors=True)
