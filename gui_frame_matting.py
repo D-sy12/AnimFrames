@@ -188,7 +188,7 @@ def matte_bgcolor_array(bgr: np.ndarray, colors: list, tol: float,
     色键抠像流水线（多背景色），输入 BGR 图像，返回 BGRA 结果。
       1. 像素到最近背景色的 RGB 距离 + 软阈值
       2. 连通域保护：只抠除与画面边缘连通的背景，保留主体内部同色
-      3. 边缘收缩(choke)：alpha 向内收 N px，吃掉主体边缘残留色边
+      3. 边缘收缩(choke)：alpha 向内收 N px（0.5px 步进，亚像素），吃掉残留色边
       4. 羽化：高斯柔化收缩后的硬边
       5. 去溢色(despill)：中和边缘的背景色晕（可 >100% 加强压制）
       6. 边缘净化(clean)：按 alpha 合成公式反解半透明像素的真实前景色
@@ -228,10 +228,14 @@ def matte_bgcolor_array(bgr: np.ndarray, colors: list, tol: float,
             bg_zone = cv2.dilate(bg_core, np.ones((k, k), np.uint8))
             alpha = np.where(bg_zone > 0, alpha, 255).astype(np.uint8)
 
-    # 3) 边缘收缩：erode 让 alpha 边缘向内收，吃掉 1~N px 残留色边
+    # 3) 边缘收缩：距离变换实现亚像素收缩（0.5px 步进）。
+    #    dist=像素到背景的距离；收缩 c px：dist<=c 处 alpha=0，
+    #    dist∈(c, c+1) 线性过渡——c=1 时直线边缘与原 3x3 erode 等效
     if choke > 0:
-        k = choke * 2 + 1
-        alpha = cv2.erode(alpha, np.ones((k, k), np.uint8))
+        dist_map = cv2.distanceTransform(
+            (alpha > 0).astype(np.uint8), cv2.DIST_L2, 3)
+        scale = np.clip(dist_map - float(choke), 0.0, 1.0)
+        alpha = (alpha.astype(np.float32) * scale).astype(np.uint8)
 
     # 4) 羽化：柔化收缩后的边缘
     if feather > 0:
@@ -319,7 +323,7 @@ class MattingWorker(QThread):
             bgr, colors,
             tol=float(self.params["tolerance"]),
             feather=int(self.params["feather"]),
-            choke=int(self.params.get("choke", 1)),
+            choke=float(self.params.get("choke", 0)),
             despill_pct=int(self.params.get("despill", 80)),
             protect_inner=bool(self.params.get("protect_inner", True)),
             edge_clean_pct=int(self.params.get("edge_clean", 0)),
@@ -688,12 +692,12 @@ class FrameMattingPage(QWidget):
         choke_row = QHBoxLayout()
         choke_row.addWidget(QLabel("边缘收缩:"))
         self.choke_slider = QSlider(Qt.Horizontal)
-        self.choke_slider.setRange(0, 4)
+        self.choke_slider.setRange(0, 8)          # 步进 0.5px → 0~4.0px
         self.choke_slider.setValue(0)
-        self.choke_label = QLabel("0")
+        self.choke_label = QLabel("0.0")
         self.choke_label.setMinimumWidth(30)
         self.choke_slider.valueChanged.connect(
-            lambda v: self.choke_label.setText(str(v)))
+            lambda v: self.choke_label.setText(f"{v / 2.0:.1f}"))
         choke_row.addWidget(self.choke_slider, 1)
         choke_row.addWidget(self.choke_label)
         bgl.addLayout(choke_row)
@@ -1136,7 +1140,7 @@ class FrameMattingPage(QWidget):
                     img[:, :, :3], list(self._bg_colors),
                     tol=float(self.tol_slider.value()),
                     feather=int(self.feather_slider.value()),
-                    choke=int(self.choke_slider.value()),
+                    choke=float(self.choke_slider.value()) / 2.0,
                     despill_pct=int(self.despill_slider.value()),
                     protect_inner=bool(self.chk_protect_inner.isChecked()),
                     edge_clean_pct=int(self.clean_slider.value()),
@@ -1345,7 +1349,7 @@ class FrameMattingPage(QWidget):
             "colors": [list(c) for c in self._bg_colors],
             "tolerance": self.tol_slider.value(),
             "feather": self.feather_slider.value(),
-            "choke": self.choke_slider.value(),
+            "choke": self.choke_slider.value() / 2.0,
             "despill": self.despill_slider.value(),
             "edge_clean": self.clean_slider.value(),
             "protect_inner": self.chk_protect_inner.isChecked(),
