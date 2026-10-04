@@ -197,7 +197,8 @@ def _psd_pascal_name(name: str) -> bytes:
 
 
 def _psd_layer_record(top: int, left: int, bottom: int, right: int,
-                      plane_blobs: List[bytes], name: str) -> bytes:
+                      plane_blobs: List[bytes], name: str,
+                      visible: bool = True) -> bytes:
     ch_info = b""
     for cid, blob in zip((0, 1, 2, -1), plane_blobs):   # R,G,B,透明
         ch_info += struct.pack(">hi", cid, 2 + len(blob))
@@ -216,18 +217,22 @@ def _psd_layer_record(top: int, left: int, bottom: int, right: int,
 
     rec = struct.pack(">iiii", top, left, bottom, right)
     rec += struct.pack(">H", 4) + ch_info
-    rec += b"8BIMnorm" + bytes((255, 0, 0, 0)) + extra
+    # flags 第2位(bit1)=隐藏：不透明255, 锁定0, flags, 填充0
+    flags = 0 if visible else 0x02
+    rec += b"8BIMnorm" + bytes((255, 0, flags, 0)) + extra
     return rec
 
 
 def write_layered_psd(path: str,
                       canvas_w: int,
                       canvas_h: int,
-                      layers: List[Tuple[str, np.ndarray, int, int]],
+                      layers: List[Tuple],
                       composite: Optional[np.ndarray] = None) -> str:
     """
     写 8 位 RGB+Alpha 的分层 PSD。
-    layers : [(图层名, BGRA 图, x, y), ...]，x/y 为左上角，可越界/负坐标
+    layers : [(图层名, BGRA 图, x, y[, visible]), ...]，
+             x/y 为左上角，可越界/负坐标；visible=False 的图层在 PSD 里
+             为隐藏状态，且不参与自动合并预览。
     composite: 可选合并预览图（BGRA，画布尺寸）；不给定则自动 over 合成
     """
     if not layers:
@@ -235,7 +240,9 @@ def write_layered_psd(path: str,
 
     records = bytearray()
     all_channel_data = bytearray()
-    for name, img, x, y in layers:
+    for layer in layers:
+        name, img, x, y = layer[0], layer[1], layer[2], layer[3]
+        visible = bool(layer[4]) if len(layer) > 4 else True
         if img.ndim != 3 or img.shape[2] != 4:
             raise ValueError(f"图层 {name} 必须是 BGRA 四通道")
         h, w = img.shape[:2]
@@ -244,7 +251,8 @@ def write_layered_psd(path: str,
                   np.ascontiguousarray(img[:, :, 0]),   # B
                   np.ascontiguousarray(img[:, :, 3]))   # A
         blobs = [_rle_channel_blob(p) for p in planes]
-        records += _psd_layer_record(y, x, y + h, x + w, blobs, name)
+        records += _psd_layer_record(y, x, y + h, x + w, blobs, name,
+                                     visible)
         for blob in blobs:
             all_channel_data += struct.pack(">H", 1) + blob   # 1=PackBits
 
@@ -260,8 +268,10 @@ def write_layered_psd(path: str,
     # 合并预览（composite image data）
     if composite is None:
         composite = np.zeros((canvas_h, canvas_w, 4), np.uint8)
-        for name, img, x, y in layers:
-            flatten_over(composite, img, x, y)
+        for layer in layers:
+            if len(layer) > 4 and not layer[4]:
+                continue                       # 隐藏图层不进合并预览
+            flatten_over(composite, layer[1], layer[2], layer[3])
     comp_planes = (np.ascontiguousarray(composite[:, :, 2]),  # R
                    np.ascontiguousarray(composite[:, :, 1]),  # G
                    np.ascontiguousarray(composite[:, :, 0]),  # B

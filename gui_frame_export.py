@@ -2,19 +2,22 @@
 """
 模块六：导出图片 - 页面（可嵌入主窗口）
 
-两大功能：
-  1. 动画精灵图（sprite sheet）—— 把全部制作好的图片拼在一张透明底
-     PNG 上，支持自动/手动列数、间距、整体缩放（调分辨率），输出尺寸
-     实时结算显示并带预览。
-  2. PSD 分层图 —— 每张图片是一个独立图层（类似 Photoshop），每个图层
-     可单独设置缩放比例（%），导出 8 位 RGBA 的 .psd，PS / Krita /
-     Clip Studio / Photopea 可直接打开。
+布局（左右固定 13:8）：
+  左侧：PS 式工作台画布（棋盘格透明底），实时合成显示所有"睁眼"图层，
+        也可切换为精灵图拼接预览。
+  右侧上半：导出参数（精灵图 PNG 排列/分辨率 + PSD 画布/统一缩放 +
+        两个导出按钮）。
+  右侧下半：所有图片按一列排列，每行 = 小眼睛(是否在工作台显示/参与
+        导出) + 缩略图 + 名称尺寸 + 该图层独立缩放%。
+
+功能：
+  1. 动画精灵图：可见帧拼一张透明底 PNG，自动/手动列数、间距、
+     10-400% 分辨率缩放。
+  2. PSD 分层图：每张图片一个图层，逐图层 5-400% 独立缩放；隐藏图层
+     在 PSD 中为隐藏状态（不进合并预览），PS / Krita / Photopea 可打开。
 
 图片来源优先级：色调统一 colored/ → 精抠 refined/ → 批量抠图 matted/。
 产物目录：frames_dir/export/（sprite_sheet.png / layers.psd）。
-
-布局与其它页面一致：左右固定 13:8。左侧导出预览（棋盘格透明底）+
-底部状态；右侧两个 Tab 分别放两套导出控件，其中 PSD 的每个图层一行。
 """
 
 import os
@@ -28,8 +31,8 @@ import cv2
 from PySide6.QtCore import Qt, QTimer, Signal, QThread
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QSlider,
-    QScrollArea, QGroupBox, QCheckBox, QSpinBox,
-    QTabWidget, QFrame, QMessageBox,
+    QScrollArea, QGroupBox, QCheckBox, QSpinBox, QToolButton,
+    QFrame, QMessageBox,
 )
 
 import export_utils as eu
@@ -68,12 +71,18 @@ class _ExportWorker(QThread):
             raise IOError(f"读取失败：{item['src']}")
         return img
 
+    def _visible(self, it: dict) -> bool:
+        return self.params["layer_visible"].get(it["key"], True)
+
     def _run_sprite(self):
         p = self.params
+        items = [it for it in self.items if self._visible(it)]
+        if not items:
+            raise ValueError("没有可见图片（全部被小眼睛隐藏）")
         images = []
-        for i, it in enumerate(self.items, 1):
+        for i, it in enumerate(items, 1):
             images.append(self._load(it))
-            self.progress.emit(f"读取图片 {i}/{len(self.items)}")
+            self.progress.emit(f"读取图片 {i}/{len(items)}")
         self.progress.emit("正在拼接精灵图…")
         canvas, _ = eu.build_sprite_sheet(
             images, columns=0 if p["auto_columns"] else p["columns"],
@@ -83,7 +92,7 @@ class _ExportWorker(QThread):
             raise IOError(f"写入失败：{self.out_path}")
         self.progress.emit(
             f"精灵图已导出：{os.path.basename(self.out_path)} "
-            f"{canvas.shape[1]}×{canvas.shape[0]}")
+            f"{canvas.shape[1]}×{canvas.shape[0]}（{len(items)} 帧）")
         self.finished_ok.emit("sprite", self.out_path)
 
     def _run_psd(self):
@@ -99,15 +108,19 @@ class _ExportWorker(QThread):
             sim = eu.scale_bgra(img, pct / 100.0)
             x, y = eu.centered_xy(cw, ch, sim.shape[1], sim.shape[0])
             name = os.path.splitext(it["key"])[0][:80]
-            layers.append((name, sim, x, y))
-            eu.flatten_over(composite, sim, x, y)
+            vis = self._visible(it)
+            layers.append((name, sim, x, y, vis))
+            if vis:
+                eu.flatten_over(composite, sim, x, y)
             self.progress.emit(f"准备图层 {i}/{len(self.items)}")
         self.progress.emit("正在写入 PSD（PackBits 压缩）…")
         os.makedirs(os.path.dirname(self.out_path), exist_ok=True)
         eu.write_layered_psd(self.out_path, cw, ch, layers, composite)
+        hidden = sum(1 for l in layers if not l[4])
+        extra = f"，其中 {hidden} 个隐藏" if hidden else ""
         self.progress.emit(
             f"PSD 已导出：{os.path.basename(self.out_path)} "
-            f"{cw}×{ch}，{len(layers)} 个图层")
+            f"{cw}×{ch}，{len(layers)} 个图层{extra}")
         self.finished_ok.emit("psd", self.out_path)
 
 
@@ -142,37 +155,91 @@ class _PreviewLoader(QThread):
         self.done.emit()
 
 
-# ===================== PSD 图层行 =====================
+# ===================== 图层行（眼睛+缩略图+名称+缩放） =====================
 
 class LayerRow(QFrame):
-    """PSD 图层列表中的一行：序号+名称+原始尺寸+独立缩放%"""
+    """所有图片列表中的一行：👁 显示开关 + 缩略图 + 名称尺寸 + 独立缩放%"""
     clicked = Signal(str)
     scale_changed = Signal(str, int)
+    visibility_changed = Signal(str, bool)
 
-    def __init__(self, key: str, number: int, w: int, h: int, pct: int):
+    def __init__(self, key: str, number: int, w: int, h: int,
+                 pct: int, visible: bool = True):
         super().__init__()
         self.key = key
         self._selected = False
+        self._visible = True
         self.setFrameShape(QFrame.StyledPanel)
         self.setCursor(Qt.PointingHandCursor)
 
         lay = QHBoxLayout(self)
-        lay.setContentsMargins(8, 3, 8, 3)
+        lay.setContentsMargins(6, 3, 6, 3)
         lay.setSpacing(6)
-        self.name_lab = QLabel(f"#{number:03d}  {key}  ({w}×{h})")
-        self.name_lab.setStyleSheet("background:transparent;")
+
+        # 小眼睛：是否在工作台显示 / 参与导出
+        self.eye = QToolButton()
+        self.eye.setCheckable(True)
+        self.eye.setFixedSize(28, 28)
+        self.eye.setCursor(Qt.PointingHandCursor)
+        self.eye.setToolTip("显示 / 隐藏该图片（隐藏后不参与导出）")
+        self.eye.setStyleSheet(
+            "QToolButton{background:transparent;border:none;"
+            "font-size:15px;color:#ecf0f1;}"
+            "QToolButton:hover{background:#3a3a3a;border-radius:4px;}")
+        self.eye.toggled.connect(self._on_eye)
+        lay.addWidget(self.eye)
+
+        # 缩略图
+        self.thumb = QLabel()
+        self.thumb.setFixedSize(48, 36)
+        self.thumb.setAlignment(Qt.AlignCenter)
+        self.thumb.setStyleSheet(
+            "background:#1a1a1a;border:1px solid #444;border-radius:2px;")
+        lay.addWidget(self.thumb)
+
+        self.name_lab = QLabel(f"#{number:03d}  {key}\n{w}×{h}")
+        self.name_lab.setStyleSheet("background:transparent;border:none;")
         self.name_lab.setToolTip(key)
         lay.addWidget(self.name_lab, 1)
+
         self.spin = QSpinBox()
         self.spin.setRange(5, 400)
         self.spin.setValue(pct)
         self.spin.setSuffix(" %")
-        self.spin.setFixedWidth(82)
+        self.spin.setFixedWidth(78)
         self.spin.setCursor(Qt.ArrowCursor)
+        self.spin.setToolTip("该图层独立缩放")
         self.spin.valueChanged.connect(
             lambda v: self.scale_changed.emit(self.key, int(v)))
         lay.addWidget(self.spin)
+
+        self.set_visible(visible, emit_signal=False)
         self._set_style()
+
+    def _on_eye(self, checked: bool):
+        self.set_visible(checked, emit_signal=True)
+
+    def set_visible(self, visible: bool, emit_signal: bool = False):
+        self._visible = visible
+        self.eye.blockSignals(True)
+        self.eye.setChecked(visible)
+        self.eye.blockSignals(False)
+        self.eye.setText("👁" if visible else "—")
+        op = "1.0" if visible else "0.45"
+        self.name_lab.setStyleSheet(
+            f"background:transparent;border:none;opacity:{op};")
+        if emit_signal:
+            self.visibility_changed.emit(self.key, visible)
+
+    def is_visible(self) -> bool:
+        return self._visible
+
+    def set_thumbnail(self, bgra: np.ndarray):
+        pm = bgra_to_pixmap(bgra)
+        if pm is None or pm.isNull():
+            return
+        self.thumb.setPixmap(pm.scaled(
+            self.thumb.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
 
     def set_selected(self, sel: bool):
         self._selected = sel
@@ -180,13 +247,12 @@ class LayerRow(QFrame):
 
     def _set_style(self):
         if self._selected:
-            border, bg, fg = "#f1c40f", "#1a3a5c", "#f1c40f"
+            border, bg = "#f1c40f", "#1a3a5c"
         else:
-            border, bg, fg = "#444444", "#1e1e1e", "#bbbbbb"
+            border, bg = "#444444", "#1e1e1e"
         self.setStyleSheet(
             f"LayerRow{{background:{bg};border:1px solid {border};"
-            f"border-radius:3px;}}"
-            f"QLabel{{color:{fg};font-size:12px;}}")
+            f"border-radius:3px;}}")
 
     def mousePressEvent(self, event):
         self.clicked.emit(self.key)
@@ -196,7 +262,7 @@ class LayerRow(QFrame):
 
 class FrameExportPage(QWidget):
 
-    PREVIEW_MAX = 1500       # 预览精灵图最长边像素
+    PREVIEW_MAX = 1500       # 预览最长边像素
     PREVIEW_CACHE = 360      # 单帧预览缓存最长边
 
     def __init__(self, shared_state: dict):
@@ -214,6 +280,8 @@ class FrameExportPage(QWidget):
         self.preview_cache: Dict[str, np.ndarray] = {}
         self.selected_key: Optional[str] = None
         self.layer_rows: List[LayerRow] = []
+        self._layer_scales: Dict[str, int] = {}
+        self._layer_visible: Dict[str, bool] = {}
         self.loader: Optional[_PreviewLoader] = None
         self.worker: Optional[_ExportWorker] = None
 
@@ -236,8 +304,8 @@ class FrameExportPage(QWidget):
         root.setContentsMargins(8, 8, 8, 8)
         root.setSpacing(8)
 
-        # ===== 左侧：预览 =====
-        left_box = QGroupBox("导出预览（棋盘格=透明）")
+        # ===== 左侧：PS 式工作台 =====
+        left_box = QGroupBox("工作台（棋盘格=透明，合成显示所有睁眼图层）")
         lv = QVBoxLayout(left_box)
         self.view = FitImageLabel(checker=True)
         lv.addWidget(self.view, 1)
@@ -249,21 +317,19 @@ class FrameExportPage(QWidget):
         lv.addWidget(self.status)
         root.addWidget(left_box, 13)
 
-        # ===== 右侧：两个功能 Tab =====
-        self.tabs = QTabWidget()
-        self.tabs.addTab(self._build_sprite_tab(), "① 精灵图 PNG")
-        self.tabs.addTab(self._build_psd_tab(), "② PSD 分层图")
-        self.tabs.currentChanged.connect(lambda _i: self._render_preview())
-        root.addWidget(self.tabs, 8)
+        # ===== 右侧：上参数 + 下图片列 =====
+        right = QVBoxLayout()
+        right.setSpacing(8)
 
-    def _build_sprite_tab(self) -> QWidget:
-        page = QWidget()
-        v = QVBoxLayout(page)
-        v.setSpacing(8)
+        # ---- 上半：导出参数 ----
+        params_box = QGroupBox("导出参数")
+        pv = QVBoxLayout(params_box)
+        pv.setSpacing(6)
 
-        g1 = QGroupBox("排列与分辨率")
-        f = QVBoxLayout(g1)
-        f.setSpacing(6)
+        # 精灵图参数
+        sprite_box = QGroupBox("精灵图 PNG")
+        sf = QVBoxLayout(sprite_box)
+        sf.setSpacing(5)
         row1 = QHBoxLayout()
         self.chk_auto_cols = QCheckBox("自动列数（近方形）")
         self.chk_auto_cols.setChecked(True)
@@ -279,21 +345,17 @@ class FrameExportPage(QWidget):
             lambda on: self.spn_cols.setEnabled(not on))
         row1.addWidget(QLabel("列数"))
         row1.addWidget(self.spn_cols)
-        f.addLayout(row1)
-
-        row2 = QHBoxLayout()
-        row2.addWidget(QLabel("间距："))
+        row1.addWidget(QLabel("间距"))
         self.spn_pad = QSpinBox()
         self.spn_pad.setRange(0, 500)
         self.spn_pad.setValue(0)
         self.spn_pad.setSuffix(" px")
         self.spn_pad.valueChanged.connect(self._on_setting_changed)
-        row2.addWidget(self.spn_pad)
-        row2.addStretch()
-        f.addLayout(row2)
+        row1.addWidget(self.spn_pad)
+        sf.addLayout(row1)
 
-        row3 = QHBoxLayout()
-        row3.addWidget(QLabel("分辨率缩放："))
+        row2 = QHBoxLayout()
+        row2.addWidget(QLabel("分辨率缩放："))
         self.sld_scale = QSlider(Qt.Horizontal)
         self.sld_scale.setRange(10, 400)
         self.sld_scale.setValue(100)
@@ -305,67 +367,71 @@ class FrameExportPage(QWidget):
         self.sld_scale.valueChanged.connect(self.spn_scale.setValue)
         self.spn_scale.valueChanged.connect(self.sld_scale.setValue)
         self.sld_scale.valueChanged.connect(self._on_setting_changed)
-        row3.addWidget(self.sld_scale, 1)
-        row3.addWidget(self.spn_scale)
-        f.addLayout(row3)
+        row2.addWidget(self.sld_scale, 1)
+        row2.addWidget(self.spn_scale)
+        sf.addLayout(row2)
 
+        row3 = QHBoxLayout()
         self.size_label = QLabel("输出尺寸：-")
         self.size_label.setStyleSheet("color:#2ecc71;")
-        f.addWidget(self.size_label)
-        v.addWidget(g1, 0)
+        row3.addWidget(self.size_label, 1)
+        self.chk_sprite_preview = QCheckBox("预览精灵图")
+        self.chk_sprite_preview.toggled.connect(self._render_preview)
+        row3.addWidget(self.chk_sprite_preview)
+        sf.addLayout(row3)
 
-        g2 = QGroupBox("导出")
-        bv = QVBoxLayout(g2)
         self.btn_export_sprite = QPushButton("💾 导出精灵图 PNG")
         self.btn_export_sprite.clicked.connect(self._export_sprite)
-        bv.addWidget(self.btn_export_sprite)
-        btn_open1 = QPushButton("📂 打开导出目录")
-        btn_open1.clicked.connect(self._open_export_dir)
-        bv.addWidget(btn_open1)
-        tip = QLabel("所有帧按序号排列拼为一张透明底图片，\n"
-                     "可用于游戏引擎 / 动画合成。")
-        tip.setStyleSheet("color:#888;font-size:11px;")
-        tip.setWordWrap(True)
-        bv.addWidget(tip)
-        v.addWidget(g2, 0)
-        v.addStretch(1)
-        return page
+        sf.addWidget(self.btn_export_sprite)
+        pv.addWidget(sprite_box)
 
-    def _build_psd_tab(self) -> QWidget:
-        page = QWidget()
-        v = QVBoxLayout(page)
-        v.setSpacing(8)
-
-        g1 = QGroupBox("画布与图层")
-        f = QVBoxLayout(g1)
-        f.setSpacing(6)
+        # PSD 参数
+        psd_box = QGroupBox("PSD 分层图")
+        pf = QVBoxLayout(psd_box)
+        pf.setSpacing(5)
         self.canvas_label = QLabel("画布尺寸：-")
         self.canvas_label.setStyleSheet("color:#2ecc71;")
-        f.addWidget(self.canvas_label)
+        pf.addWidget(self.canvas_label)
 
-        row = QHBoxLayout()
-        self.chk_merged = QCheckBox("预览合并效果")
-        self.chk_merged.toggled.connect(self._schedule_preview)
-        row.addWidget(self.chk_merged)
-        row.addStretch()
-        row.addWidget(QLabel("统一缩放"))
+        row4 = QHBoxLayout()
+        row4.addWidget(QLabel("统一缩放"))
         self.spn_all = QSpinBox()
         self.spn_all.setRange(5, 400)
         self.spn_all.setValue(100)
         self.spn_all.setSuffix(" %")
         self.spn_all.setFixedWidth(82)
-        row.addWidget(self.spn_all)
-        btn_apply_all = QPushButton("应用到全部")
+        row4.addWidget(self.spn_all)
+        btn_apply_all = QPushButton("应用到全部图层")
         btn_apply_all.clicked.connect(self._apply_scale_all)
-        row.addWidget(btn_apply_all)
+        row4.addWidget(btn_apply_all)
         btn_reset_all = QPushButton("全部100%")
         btn_reset_all.clicked.connect(self._reset_scale_all)
-        row.addWidget(btn_reset_all)
-        f.addLayout(row)
-        v.addWidget(g1, 0)
+        row4.addWidget(btn_reset_all)
+        row4.addStretch()
+        pf.addLayout(row4)
 
-        g2 = QGroupBox("每个图层可单独缩放（点击行选中）")
-        gl = QVBoxLayout(g2)
+        row5 = QHBoxLayout()
+        btn_all_show = QPushButton("全部显示")
+        btn_all_show.clicked.connect(lambda: self._set_all_visible(True))
+        row5.addWidget(btn_all_show)
+        btn_all_hide = QPushButton("全部隐藏")
+        btn_all_hide.clicked.connect(lambda: self._set_all_visible(False))
+        row5.addWidget(btn_all_hide)
+        row5.addStretch()
+        self.btn_export_psd = QPushButton("💾 导出 PSD 分层图")
+        self.btn_export_psd.clicked.connect(self._export_psd)
+        row5.addWidget(self.btn_export_psd)
+        pf.addLayout(row5)
+
+        btn_open = QPushButton("📂 打开导出目录")
+        btn_open.clicked.connect(self._open_export_dir)
+        pf.addWidget(btn_open)
+        pv.addWidget(psd_box)
+        right.addWidget(params_box, 0)
+
+        # ---- 下半：所有图片（单列，眼睛+缩略图+缩放） ----
+        list_box = QGroupBox("所有图片（👁=是否显示，点击行选中）")
+        gl = QVBoxLayout(list_box)
         gl.setContentsMargins(4, 6, 4, 4)
         self.layer_scroll = QScrollArea()
         self.layer_scroll.setWidgetResizable(True)
@@ -378,18 +444,9 @@ class FrameExportPage(QWidget):
         self.layer_layout.addStretch()
         self.layer_scroll.setWidget(self.layer_host)
         gl.addWidget(self.layer_scroll)
-        v.addWidget(g2, 1)
+        right.addWidget(list_box, 1)
 
-        g3 = QGroupBox("导出")
-        bv = QVBoxLayout(g3)
-        self.btn_export_psd = QPushButton("💾 导出 PSD 分层图")
-        self.btn_export_psd.clicked.connect(self._export_psd)
-        bv.addWidget(self.btn_export_psd)
-        btn_open2 = QPushButton("📂 打开导出目录")
-        btn_open2.clicked.connect(self._open_export_dir)
-        bv.addWidget(btn_open2)
-        v.addWidget(g3, 0)
-        return page
+        root.addLayout(right, 8)
 
     # ---------- 批次/加载 ----------
 
@@ -546,7 +603,6 @@ class FrameExportPage(QWidget):
         self.canvas_label.setText("画布尺寸：-")
         self.btn_export_sprite.setEnabled(False)
         self.btn_export_psd.setEnabled(False)
-        # 清空图层列表
         while self.layer_layout.count() > 1:
             it = self.layer_layout.takeAt(0)
             if it.widget():
@@ -572,6 +628,10 @@ class FrameExportPage(QWidget):
 
     def _on_preview_one(self, key: str, img: np.ndarray):
         self.preview_cache[key] = img
+        for r in self.layer_rows:
+            if r.key == key:
+                r.set_thumbnail(img)
+                break
         if len(self.preview_cache) == 1 or len(self.preview_cache) % 5 == 0:
             self._render_preview()
         self.status_text(f"正在生成预览 {len(self.preview_cache)}"
@@ -596,25 +656,33 @@ class FrameExportPage(QWidget):
         if self.preview_cache:
             self._preview_timer.start()
 
+    def _visible_items(self) -> List[dict]:
+        return [it for it in self.items
+                if self._layer_visible.get(it["key"], True)]
+
     def _update_size_info(self):
         if not self.items:
             self.size_label.setText("输出尺寸：-")
             self.canvas_label.setText("画布尺寸：-")
             return
         p = self._sprite_params()
-        W, H, cols, rows = eu.sprite_sheet_size(
-            [(it["w"], it["h"]) for it in self.items],
-            columns=0 if p["auto_columns"] else p["columns"],
-            scale=p["sprite_scale"] / 100.0,
-            padding=p["padding"])
-        self.size_label.setText(
-            f"输出尺寸：{W} × {H} px（{cols} 列 × {rows} 行，"
-            f"{len(self.items)} 帧）")
+        vis = self._visible_items()
+        if vis:
+            W, H, cols, rows = eu.sprite_sheet_size(
+                [(it["w"], it["h"]) for it in vis],
+                columns=0 if p["auto_columns"] else p["columns"],
+                scale=p["sprite_scale"] / 100.0,
+                padding=p["padding"])
+            self.size_label.setText(
+                f"输出尺寸：{W} × {H} px（{cols}列×{rows}行，"
+                f"{len(vis)}/{len(self.items)} 帧可见）")
+        else:
+            self.size_label.setText("输出尺寸：-（全部图层已隐藏）")
         cw = max(it["w"] for it in self.items)
         ch = max(it["h"] for it in self.items)
         self.canvas_label.setText(f"画布尺寸：{cw} × {ch} px（每帧居中）")
 
-    # ---------- PSD 图层列表 ----------
+    # ---------- 图层列表 ----------
 
     def _rebuild_layer_list(self):
         while self.layer_layout.count() > 1:
@@ -624,16 +692,19 @@ class FrameExportPage(QWidget):
         self.layer_rows = []
         for it in self.items:
             pct = int(self._layer_scales.get(it["key"], 100))
-            row = LayerRow(it["key"], it["number"], it["w"], it["h"], pct)
+            vis = bool(self._layer_visible.get(it["key"], True))
+            row = LayerRow(it["key"], it["number"], it["w"], it["h"],
+                           pct, vis)
             row.clicked.connect(self._select_layer)
             row.scale_changed.connect(self._on_layer_scale_changed)
+            row.visibility_changed.connect(self._on_layer_visibility)
             self.layer_layout.insertWidget(self.layer_layout.count() - 1, row)
             self.layer_rows.append(row)
         self._sync_row_selection()
 
     def _select_layer(self, key: str):
         self.selected_key = key
-        self.chk_merged.setChecked(False)
+        self.chk_sprite_preview.setChecked(False)
         self._sync_row_selection()
         self._render_preview()
 
@@ -645,6 +716,21 @@ class FrameExportPage(QWidget):
         self._layer_scales[key] = pct
         self._schedule_preview()
         self._save_timer.start()
+
+    def _on_layer_visibility(self, key: str, visible: bool):
+        self._layer_visible[key] = visible
+        self._update_size_info()
+        self._schedule_preview()
+        self._save_timer.start()
+
+    def _set_all_visible(self, visible: bool):
+        for r in self.layer_rows:
+            r.set_visible(visible)          # 批量设置不发单行信号
+            self._layer_visible[r.key] = visible
+        self._update_size_info()
+        self._schedule_preview()
+        self._save_timer.start()
+        self.status_text("全部图层已显示" if visible else "全部图层已隐藏")
 
     def _apply_scale_all(self):
         v = self.spn_all.value()
@@ -658,28 +744,62 @@ class FrameExportPage(QWidget):
         self.spn_all.setValue(100)
         self.status_text("全部图层缩放已恢复 100%")
 
-    # ---------- 预览渲染 ----------
+    # ---------- 工作台渲染 ----------
 
     def _render_preview(self):
         if not self.items:
             self.view.set_image(None)
             return
-        if self.tabs.currentIndex() == 0:
+        if self.chk_sprite_preview.isChecked():
             self._render_sprite_preview()
         else:
-            self._render_psd_preview()
+            self._render_workspace()
 
-    def _ready_images(self) -> List[Tuple[dict, np.ndarray]]:
-        return [(it, self.preview_cache[it["key"]])
-                for it in self.items if it["key"] in self.preview_cache]
+    def _ready_images(self) -> Dict[str, np.ndarray]:
+        return {k: v for k, v in self.preview_cache.items()}
+
+    def _render_workspace(self):
+        """PS 式工作台：合成所有可见图层；无可见图层时显示选中层"""
+        cache = self._ready_images()
+        if not cache or not self.items:
+            return
+        cw = max(it["w"] for it in self.items)
+        ch = max(it["h"] for it in self.items)
+        # 预览用小图等比计算画布
+        pf = min(1.0, self.PREVIEW_MAX / max(1.0, max(cw, ch)))
+        pw = max(1, int(cw * pf))
+        ph = max(1, int(ch * pf))
+        canvas = np.zeros((ph, pw, 4), np.uint8)
+        shown = 0
+        for it in self.items:
+            if not self._layer_visible.get(it["key"], True):
+                continue
+            im = cache.get(it["key"])
+            if im is None:
+                continue
+            pct = self._layer_scales.get(it["key"], 100) / 100.0
+            sim = eu.scale_bgra(im, pct * pf)
+            x, y = eu.centered_xy(pw, ph, sim.shape[1], sim.shape[0])
+            eu.flatten_over(canvas, sim, x, y)
+            shown += 1
+        self.view.set_image(bgra_to_pixmap(canvas))
+        total = len(self.items)
+        hidden = total - len(self._visible_items())
+        self.info_label.setText(
+            f"工作台合成：{shown} 个可见图层"
+            + (f"，{hidden} 个已隐藏" if hidden else "")
+            + f"（共 {total} 张）")
 
     def _render_sprite_preview(self):
-        ready = self._ready_images()
+        cache = self._ready_images()
+        ready = [(it, cache[it["key"]]) for it in self._visible_items()
+                 if it["key"] in cache]
         if not ready:
+            self.view.set_image(None)
+            self.info_label.setText("没有可见图层可拼接")
             return
         p = self._sprite_params()
         user_scale = p["sprite_scale"] / 100.0
-        # 用缓存小图先按 1:1 结算基础尺寸，再整体等比收进预览上限
         base_sizes = [(im.shape[1], im.shape[0]) for _, im in ready]
         W0, H0, _, _ = eu.sprite_sheet_size(
             base_sizes,
@@ -693,38 +813,8 @@ class FrameExportPage(QWidget):
             scale=user_scale * pf, padding=max(1, int(p["padding"] * pf)))
         self.view.set_image(bgra_to_pixmap(sheet))
         self.info_label.setText(
-            f"精灵图预览（{len(ready)}/{len(self.items)} 帧，"
+            f"精灵图预览（{len(ready)} 个可见帧，"
             f"预览缩放 {user_scale * pf:.2f}×）")
-
-    def _render_psd_preview(self):
-        ready = self._ready_images()
-        if not ready:
-            return
-        cw = max(im.shape[1] for _, im in ready)
-        ch = max(im.shape[0] for _, im in ready)
-        canvas = np.zeros((ch, cw, 4), np.uint8)
-        if self.chk_merged.isChecked():
-            for it, im in ready:
-                pct = self._layer_scales.get(it["key"], 100) / 100.0
-                sim = eu.scale_bgra(im, pct)
-                x, y = eu.centered_xy(cw, ch, sim.shape[1], sim.shape[0])
-                eu.flatten_over(canvas, sim, x, y)
-            what = "全部图层合并效果"
-        else:
-            it = next((x for x in self.items
-                       if x["key"] == self.selected_key), None)
-            if it is None or it["key"] not in self.preview_cache:
-                it, im = ready[0]
-            else:
-                im = self.preview_cache[it["key"]]
-            pct = self._layer_scales.get(it["key"], 100) / 100.0
-            sim = eu.scale_bgra(im, pct)
-            x, y = eu.centered_xy(cw, ch, sim.shape[1], sim.shape[0])
-            eu.flatten_over(canvas, sim, x, y)
-            what = f"当前图层：{it['key']}（{int(round(pct*100))}%）"
-        self.view.set_image(bgra_to_pixmap(canvas))
-        self.info_label.setText(
-            f"PSD 预览：{what}（{len(ready)}/{len(self.items)} 帧已缓存）")
 
     # ---------- 导出 ----------
 
@@ -735,6 +825,7 @@ class FrameExportPage(QWidget):
         out_path = os.path.join(self.export_dir, name)
         params = self._sprite_params()
         params["layer_scales"] = dict(self._layer_scales)
+        params["layer_visible"] = dict(self._layer_visible)
         self.worker = _ExportWorker(mode, self.items, params, out_path)
         self.worker.progress.connect(self.status_text)
         self.worker.failed.connect(self._on_export_failed)
@@ -791,11 +882,16 @@ class FrameExportPage(QWidget):
         self.spn_pad.setValue(int(data.get("padding", 0)))
         self.spn_scale.setValue(max(10, min(400,
                                             int(data.get("sprite_scale", 100)))))
-        saved_scales = data.get("layer_scales", {})
+        self.chk_sprite_preview.setChecked(
+            bool(data.get("sprite_preview", False)))
         keys = {it["key"] for it in self.items}
+        saved_scales = data.get("layer_scales", {})
         self._layer_scales = {
             k: max(5, min(400, int(v)))
             for k, v in saved_scales.items() if k in keys}
+        saved_vis = data.get("layer_visible", {})
+        self._layer_visible = {k: bool(v)
+                               for k, v in saved_vis.items() if k in keys}
 
     def _write_info(self):
         if not self.export_dir or not self.items:
@@ -806,8 +902,9 @@ class FrameExportPage(QWidget):
             "columns": self.spn_cols.value(),
             "padding": self.spn_pad.value(),
             "sprite_scale": self.spn_scale.value(),
-            "merged_preview": self.chk_merged.isChecked(),
+            "sprite_preview": self.chk_sprite_preview.isChecked(),
             "layer_scales": self._layer_scales,
+            "layer_visible": self._layer_visible,
         }
         try:
             with open(self._info_path(), "w", encoding="utf-8") as f:
