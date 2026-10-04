@@ -115,30 +115,27 @@ def border_connected_mask(seed: np.ndarray) -> np.ndarray:
 
 def decontaminate_edges(bgr: np.ndarray, alpha: np.ndarray,
                         bg_bgr: np.ndarray, strength: float,
-                        a_floor: float = 0.03,
-                        max_gain: float = 3.0) -> np.ndarray:
+                        a_floor: float = 0.03) -> np.ndarray:
     """
     边缘净化：半透明边缘像素的观察色是 alpha 合成的结果
         C = a*F + (1-a)*B   （F 真实前景色，B 已知背景色）
-    已知 alpha 和 B 即可反解真实前景色：F = C + ((1-a)/a)*(C-B)。
+    已知 alpha 和 B 即可反解真实前景色：F = (C - (1-a)*B) / a。
     与"去溢色"只压背景色主导分量不同，本操作按合成原理把混入的
     背景色整体扣除，对深色、浅色、三分量接近的背景都有效。
-    alpha 必须传入收缩/羽化前的原始 key alpha（能真实反映混合比例），
-    否则增益 (1-a)/a 被低估的 alpha 放大，反解会过冲成黑边/品红边。
-    增益同时受 max_gain 封顶，避免低 alpha 像素数值发散。
+    alpha < a_floor 的像素反解数值不稳定，保持原色（视觉贡献可忽略）。
     strength: 0.0~2.0（100%=完全反解，>100% 过度外推用于顽固色边）。
     """
     if strength <= 0:
         return bgr
     a = alpha.astype(np.float32) / 255.0
-    semi = (a >= a_floor) & (a < 0.997)
+    semi = a >= a_floor
     if not semi.any():
         return bgr
     src = bgr.astype(np.float32)
-    gain = np.minimum((1.0 - a) / np.maximum(a, 1e-4), max_gain)
-    est = src + gain[..., None] * (src - bg_bgr)   # 反解前景色
+    af = np.maximum(a, 1e-3)[..., None]
+    est = (src - (1.0 - af) * bg_bgr) / af      # 反解前景色
     est = np.clip(est, 0.0, 255.0)
-    out = src + (est - src) * strength             # 按强度向净色靠拢
+    out = src + (est - src) * strength          # 按强度向净色靠拢
     out = np.where(semi[..., None], out, src)
     return np.clip(out, 0.0, 255.0).astype(np.uint8)
 
@@ -193,8 +190,6 @@ def matte_bgcolor_array(bgr: np.ndarray, colors: list, tol: float,
     # 3) 边缘收缩：距离变换实现亚像素收缩（0.5px 步进）。
     #    dist=像素到背景的距离；收缩 c px：dist<=c 处 alpha=0，
     #    dist∈(c, c+1) 线性过渡——c=1 时直线边缘与原 3x3 erode 等效
-    #    key_alpha：收缩/羽化前的原始 alpha，供边缘净化反解混合比例
-    key_alpha = alpha.copy() if need_clean else None
     if choke > 0:
         dist_map = cv2.distanceTransform(
             (alpha > 0).astype(np.uint8), cv2.DIST_L2, 3)
@@ -206,10 +201,9 @@ def matte_bgcolor_array(bgr: np.ndarray, colors: list, tol: float,
         k = feather * 2 + 1
         alpha = cv2.GaussianBlur(alpha, (k, k), 0)
 
-    # 5) 边缘净化：用 key alpha 反解半透明像素的真实前景色，
-    #    整体扣除混入的背景色
+    # 5) 边缘净化：反解半透明像素的真实前景色，整体扣除混入的背景色
     if need_clean:
-        bgr = decontaminate_edges(bgr, key_alpha, best_bg,
+        bgr = decontaminate_edges(bgr, alpha, best_bg,
                                   edge_clean_pct / 100.0)
 
     out = cv2.cvtColor(bgr, cv2.COLOR_BGR2BGRA)
@@ -678,7 +672,7 @@ class FrameMattingPage(QWidget):
 
         opt_row = QHBoxLayout()
         self.chk_protect_inner = QCheckBox("保护主体内部同色（防误删）")
-        self.chk_protect_inner.setChecked(True)
+        self.chk_protect_inner.setChecked(False)
         opt_row.addWidget(self.chk_protect_inner)
         opt_row.addStretch()
         bgl.addLayout(opt_row)
