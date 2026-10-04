@@ -7,7 +7,7 @@
   2. 帧数选择
   3. 批量抠图
   4. 图片精抠
-  5. 色调统一（开发中）
+  5. 色调统一
   6. 导出图片（开发中）
 
 运行：
@@ -26,6 +26,7 @@ from gui_video_to_frames import VideoToFramesPage
 from gui_frame_selector import FrameSelectorPage
 from gui_frame_matting import FrameMattingPage
 from gui_frame_refine import FrameRefinePage
+from gui_frame_color import FrameColorPage
 
 
 # ===================== 占位页面（待开发模块） =====================
@@ -137,9 +138,7 @@ class MainApp(QMainWindow):
         self.stack.addWidget(self.page_refine)
 
         # 页面 5：色调统一
-        self.page_color = PlaceholderPage(
-            "色调统一",
-            "以原图为基准，统一选中帧的色调（Reinhard 迁移 + 直方图匹配）")
+        self.page_color = FrameColorPage(self.shared_state)
         self.stack.addWidget(self.page_color)
 
         # 页面 6：导出图片
