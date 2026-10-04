@@ -729,6 +729,29 @@ class FrameMattingPage(QWidget):
         view_row.addWidget(self.rb_view_result)
         view_row.addStretch()
         nv.addLayout(view_row)
+
+        # 残留背景色检测
+        res_row = QHBoxLayout()
+        self.chk_residue = QCheckBox("🔍 残留高亮")
+        self.chk_residue.setToolTip(
+            "把抠图结果中仍然不透明、但颜色接近背景色的像素\n"
+            "用品红色标记出来，方便检查有没有抠干净")
+        res_row.addWidget(self.chk_residue)
+        res_row.addWidget(QLabel("判定:"))
+        self.residue_slider = QSlider(Qt.Horizontal)
+        self.residue_slider.setRange(10, 120)
+        self.residue_slider.setValue(45)
+        self.residue_slider.setToolTip("与背景色的颜色距离小于该值即判为可疑残留")
+        self.residue_label = QLabel("45")
+        self.residue_label.setMinimumWidth(26)
+        res_row.addWidget(self.residue_slider, 1)
+        res_row.addWidget(self.residue_label)
+        nv.addLayout(res_row)
+        self.residue_info = QLabel("")
+        self.residue_info.setStyleSheet("color:#e056fd; font-size:11px;")
+        self.residue_info.setWordWrap(True)
+        nv.addWidget(self.residue_info)
+
         rlay.addWidget(nav_box, 0)
 
         # --- 图片存放区（抠图结果网格） ---
@@ -765,6 +788,12 @@ class FrameMattingPage(QWidget):
                    self.choke_slider, self.despill_slider):
             _s.valueChanged.connect(self._schedule_preview)
         self.chk_protect_inner.toggled.connect(self._schedule_preview)
+
+        # 残留高亮开关 / 判定阈值 → 刷新结果显示
+        self.chk_residue.toggled.connect(self._on_residue_changed)
+        self.residue_slider.valueChanged.connect(
+            lambda v: self.residue_label.setText(str(v)))
+        self.residue_slider.valueChanged.connect(self._on_residue_changed)
 
     # ---------- 加载 ----------
 
@@ -865,6 +894,7 @@ class FrameMattingPage(QWidget):
                 "选中的帧会自动同步到本页")
             self.pos_label.setText("- / -")
             self.cur_image = None
+            self.residue_info.setText("")
             return
 
         item = self.frames[self.cur_index]
@@ -885,44 +915,59 @@ class FrameMattingPage(QWidget):
 
         show_result = (self.rb_view_result.isChecked()
                        and self.cur_index in self.results)
-        src = self.results.get(self.cur_index) if show_result else item.filepath
-        pix = QPixmap(src)
+        if show_result:
+            self._render_saved_result(self.results[self.cur_index])
+            return
+
+        # 原图视图
+        self.residue_info.setText("")
+        pix = QPixmap(item.filepath)
         if pix.isNull():
             return
         scaled = pix.scaled(self.preview_label.size(), Qt.KeepAspectRatio,
                             Qt.SmoothTransformation)
-        if show_result:
-            scaled = compose_checkerboard(scaled)
         self.preview_label.setPixmap(scaled)
 
-    # ---------- 参数实时预览 ----------
+    # ---------- 残留背景色检测 ----------
 
-    def _schedule_preview(self):
-        """参数/颜色/帧变化后请求一次实时预览（80ms 防抖）"""
-        self._preview_timer.start()
+    def _on_residue_changed(self):
+        if self.rb_view_result.isChecked():
+            self._schedule_preview()
+        else:
+            self.residue_info.setText("")
 
-    def _live_preview(self):
-        """背景色模式：用界面上的当前参数实时抠当前帧，显示到工作区"""
-        if self.worker is not None and self.worker.isRunning():
-            return
-        if not self.rb_mode_bg.isChecked() or not self.rb_view_result.isChecked():
-            return
-        if not (0 <= self.cur_index < len(self.frames)) or not self._bg_colors:
-            return
-        item = self.frames[self.cur_index]
-        img = imread_unicode(item.filepath)
-        if img is None:
-            return
-        if img.ndim == 2:
-            img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
-        bgra = matte_bgcolor_array(
-            img[:, :, :3], list(self._bg_colors),
-            tol=float(self.tol_slider.value()),
-            feather=int(self.feather_slider.value()),
-            choke=int(self.choke_slider.value()),
-            despill_pct=int(self.despill_slider.value()),
-            protect_inner=bool(self.chk_protect_inner.isChecked()),
-        )
+    @staticmethod
+    def _ensure_bgra(arr: Optional[np.ndarray]) -> Optional[np.ndarray]:
+        if arr is None:
+            return None
+        if arr.ndim == 2:
+            return cv2.cvtColor(arr, cv2.COLOR_GRAY2BGRA)
+        if arr.shape[2] == 3:
+            return cv2.cvtColor(arr, cv2.COLOR_BGR2BGRA)
+        return arr
+
+    def _overlay_residue(self, bgra: np.ndarray) -> np.ndarray:
+        """找出不透明但颜色接近任一背景色的可疑像素，用品红标记"""
+        thr = float(self.residue_slider.value())
+        bgr = bgra[:, :, :3].astype(np.int16)
+        dmin = None
+        for r, g, b in self._bg_colors:
+            d = np.linalg.norm(bgr - np.array([b, g, r], np.int16), axis=2)
+            dmin = d if dmin is None else np.minimum(dmin, d)
+        visible = bgra[:, :, 3] >= 128       # 只检查基本不透明的像素
+        mask = (dmin < thr) & visible
+        n_res = int(mask.sum())
+        # 轻微膨胀，让单个残留点也肉眼可见
+        mark = cv2.dilate(mask.astype(np.uint8),
+                          np.ones((3, 3), np.uint8), iterations=1).astype(bool)
+        out = bgra.copy()
+        out[mark] = (255, 0, 255, 255)       # 品红 BGR
+        n_vis = max(1, int(visible.sum()))
+        self.residue_info.setText(
+            f"品红=可疑残留 {n_res} 像素（占不透明区域 {n_res / n_vis * 100:.2f}%）")
+        return out
+
+    def _show_bgra(self, bgra: np.ndarray):
         rgba = cv2.cvtColor(bgra, cv2.COLOR_BGRA2RGBA)
         h, w = rgba.shape[:2]
         qimg = QImage(rgba.data, w, h, w * 4,
@@ -931,6 +976,78 @@ class FrameMattingPage(QWidget):
             self.preview_label.size(), Qt.KeepAspectRatio,
             Qt.SmoothTransformation)
         self.preview_label.setPixmap(compose_checkerboard(pix))
+
+    def _render_saved_result(self, path: str):
+        """渲染已落盘的抠图结果（可选残留高亮叠加）"""
+        if self.chk_residue.isChecked():
+            if not self._bg_colors:
+                self.residue_info.setText("请先在背景色列表中添加要检查的颜色")
+            else:
+                bgra = self._ensure_bgra(imread_unicode(path))
+                if bgra is not None:
+                    self._show_bgra(self._overlay_residue(bgra))
+                    return
+        else:
+            self.residue_info.setText("")
+        pix = QPixmap(path)
+        if pix.isNull():
+            return
+        scaled = pix.scaled(self.preview_label.size(), Qt.KeepAspectRatio,
+                            Qt.SmoothTransformation)
+        self.preview_label.setPixmap(compose_checkerboard(scaled))
+
+    # ---------- 参数实时预览 ----------
+
+    def _schedule_preview(self):
+        """参数/颜色/帧变化后请求一次实时预览（80ms 防抖）"""
+        self._preview_timer.start()
+
+    def _live_preview(self):
+        """结果视图刷新：背景色模式实时抠图；或对已保存结果做残留高亮"""
+        if self.worker is not None and self.worker.isRunning():
+            return
+        if not self.rb_view_result.isChecked():
+            return
+        overlay_on = self.chk_residue.isChecked()
+
+        # 1) 背景色模式：用当前参数实时抠当前帧
+        bgra = None
+        if (self.rb_mode_bg.isChecked() and self._bg_colors
+                and 0 <= self.cur_index < len(self.frames)):
+            item = self.frames[self.cur_index]
+            img = imread_unicode(item.filepath)
+            if img is not None:
+                if img.ndim == 2:
+                    img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+                bgra = matte_bgcolor_array(
+                    img[:, :, :3], list(self._bg_colors),
+                    tol=float(self.tol_slider.value()),
+                    feather=int(self.feather_slider.value()),
+                    choke=int(self.choke_slider.value()),
+                    despill_pct=int(self.despill_slider.value()),
+                    protect_inner=bool(self.chk_protect_inner.isChecked()),
+                )
+
+        if bgra is not None:
+            if overlay_on:
+                bgra = self._overlay_residue(bgra)
+            else:
+                self.residue_info.setText("")
+            self._show_bgra(bgra)
+            return
+
+        # 2) 静态已保存结果（rembg 结果等）
+        src = self.results.get(self.cur_index)
+        if src is not None:
+            if overlay_on and self._bg_colors:
+                bgra = self._ensure_bgra(imread_unicode(src))
+                if bgra is not None:
+                    self._show_bgra(self._overlay_residue(bgra))
+            elif overlay_on:
+                self.residue_info.setText("请先在背景色列表中添加要检查的颜色")
+            else:
+                # 关闭高亮：恢复普通结果显示并清空统计
+                self._render_saved_result(src)
 
     # ---------- 取色 ----------
 
