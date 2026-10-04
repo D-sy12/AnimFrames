@@ -76,8 +76,15 @@ def flatten_over(canvas: np.ndarray, layer: np.ndarray,
     sx1, sy1 = sx0 + (x1 - x0), sy0 + (y1 - y0)
     sub = layer[sy0:sy1, sx0:sx1].astype(np.float32)
     dst = canvas[y0:y1, x0:x1].astype(np.float32)
-    a = sub[:, :, 3:4] / 255.0
-    out = sub[:, :, :4] * a + dst * (1 - a)
+    sa = sub[:, :, 3:4] / 255.0
+    da = dst[:, :, 3:4] / 255.0
+    # 标准 straight-alpha over：先做预乘累积，再除回总覆盖率
+    ao = sa + da * (1.0 - sa)
+    prem = sub[:, :, :3] * sa + dst[:, :, :3] * da * (1.0 - sa)
+    safe = np.clip(ao, 1e-6, None)
+    out = np.empty_like(dst)
+    out[:, :, :3] = np.where(ao > 1e-6, prem / safe, 0.0)
+    out[:, :, 3:4] = ao * 255.0
     canvas[y0:y1, x0:x1] = np.clip(out, 0, 255).astype(np.uint8)
     return canvas
 

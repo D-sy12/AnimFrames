@@ -22,17 +22,19 @@
 
 import os
 import json
+import time
 import shutil
 from typing import Optional, List, Dict, Tuple
 
 import numpy as np
 import cv2
 
-from PySide6.QtCore import Qt, QTimer, Signal, QThread
+from PySide6.QtCore import Qt, QTimer, Signal, QThread, QRectF
+from PySide6.QtGui import QKeySequence, QShortcut, QPixmap, QPainter, QColor
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QSlider,
     QScrollArea, QGroupBox, QCheckBox, QSpinBox, QToolButton,
-    QFrame, QMessageBox,
+    QFrame, QMessageBox, QFileDialog,
 )
 
 import export_utils as eu
@@ -45,8 +47,10 @@ from gui_frame_color import FitImageLabel, bgra_to_pixmap
 class WorkspaceCanvas(FitImageLabel):
     """PS 式工作台：记录显示区域，把鼠标拖拽换算成全分辨率画布坐标增量"""
 
-    drag_delta = Signal(float, float)    # (dx, dy) 全分辨率画布像素
+    drag_started = Signal()             # 左键按下（拖拽事务开始）
+    drag_delta = Signal(float, float)   # (dx, dy) 全分辨率画布像素
     drag_finished = Signal()
+    resized = Signal()
 
     def __init__(self, checker: bool = True):
         super().__init__(checker)
@@ -54,6 +58,21 @@ class WorkspaceCanvas(FitImageLabel):
         self.canvas_wh = (1, 1)          # 当前画布全分辨率宽高（换算用）
         self._last = None
         self.tool = "move"               # "move" / "scale"
+        # 工作台分层：below / selected / above 三张 pixmap，
+        # 拖拽时只换 selected，合成交给 QPainter（C++ 光栅化快路径）
+        self._layer_below = None
+        self._layer_above = None
+        self._layer_sel = None
+        self._sel_rect = None            # (x,y,w,h) 预览画布坐标
+        self._rect_key = None
+        self._scaled_size = None
+        self._checker_tile = None
+        # 视图缩放：滚轮以鼠标为锚缩放，中键拖拽平移；1.0 = 适配窗口
+        self._zoom = 1.0
+        self._pan_x = 0.0
+        self._pan_y = 0.0
+        self._pan_last = None
+        self.zoom_changed = None         # 由页面赋值为回调(percent:int)
         self.setCursor(Qt.OpenHandCursor)
 
     def set_tool(self, tool: str):
@@ -61,28 +80,168 @@ class WorkspaceCanvas(FitImageLabel):
         self.setCursor(Qt.OpenHandCursor if tool == "move"
                        else Qt.SizeAllCursor)
 
+    def set_image(self, pix):
+        """普通（精灵图预览）模式：退出分层模式，并复位视图缩放"""
+        self._layer_below = None
+        self._layer_above = None
+        self._layer_sel = None
+        self._sel_rect = None
+        self._zoom = 1.0
+        self._pan_x = self._pan_y = 0.0
+        self._notify_zoom()
+        super().set_image(pix)
+
+    def set_workspace_layers(self, anchor, below, above,
+                             sel_pm, sel_rect):
+        self._layer_below = below
+        self._layer_above = above
+        self._layer_sel = sel_pm
+        self._sel_rect = sel_rect
+        self._pix = anchor               # 仅用于几何/坐标换算
+        self._rect_key = None
+        self.update()
+
+    def resizeEvent(self, e):
+        if self._layer_below is not None:
+            self._rect_key = None
+            self.update()
+        else:
+            super().resizeEvent(e)
+        self.resized.emit()
+
+    def _target_rect(self):
+        """预览画布在控件中的等比显示矩形（QRectF），并刷新 _disp_rect"""
+        if self._pix is None or self._pix.isNull():
+            self._disp_rect = None
+            return None
+        pw, ph = self._pix.width(), self._pix.height()
+        key = (self.width(), self.height(), pw, ph)
+        if key != self._rect_key:
+            scaled = self._pix.scaled(self.size(), Qt.KeepAspectRatio,
+                                      Qt.FastTransformation)
+            self._rect_key = key
+            self._scaled_size = (scaled.width(), scaled.height())
+        sw, sh = self._scaled_size
+        sw, sh = sw * self._zoom, sh * self._zoom
+        x = (self.width() - sw) / 2 + self._pan_x
+        y = (self.height() - sh) / 2 + self._pan_y
+        self._disp_rect = (int(x), int(y), int(sw), int(sh))
+        return QRectF(x, y, sw, sh)
+
+    # ---------- 视图缩放/平移 ----------
+
+    ZOOM_MIN, ZOOM_MAX = 0.05, 20.0
+
+    def _notify_zoom(self):
+        if self.zoom_changed:
+            self.zoom_changed(int(round(self._zoom * 100)))
+
+    def zoom_reset(self):
+        self._zoom = 1.0
+        self._pan_x = self._pan_y = 0.0
+        self._rect_key = None
+        self.update()
+        self._notify_zoom()
+
+    def zoom_step(self, factor: float):
+        """按钮缩放：以视图中心为锚"""
+        self._apply_zoom(self._zoom * factor,
+                         self.width() / 2, self.height() / 2)
+
+    def _apply_zoom(self, new_zoom: float, mx: float, my: float):
+        new_zoom = max(self.ZOOM_MIN, min(self.ZOOM_MAX, new_zoom))
+        if new_zoom == self._zoom:
+            return
+        rect = self._target_rect()
+        if rect is None:
+            return
+        k = new_zoom / self._zoom
+        cx, cy = rect.x(), rect.y()
+        # 保持鼠标下的画布点不动：rect 左上角相对鼠标的距离按比例伸缩
+        self._pan_x = mx - (mx - cx) * k - (self.width() - rect.width() * k) / 2
+        self._pan_y = my - (my - cy) * k - (self.height() - rect.height() * k) / 2
+        self._zoom = new_zoom
+        self._rect_key = None
+        self.update()
+        self._notify_zoom()
+
+    def wheelEvent(self, e):
+        if self._pix is not None and not self._pix.isNull():
+            factor = 1.25 if e.angleDelta().y() > 0 else 0.8
+            pos = e.position()
+            self._apply_zoom(self._zoom * factor, pos.x(), pos.y())
+            e.accept()
+            return
+        super().wheelEvent(e)
+
+    def paintEvent(self, event):
+        if self._layer_below is None and \
+                (self._pix is None or self._pix.isNull()):
+            super().paintEvent(event)
+            return
+        rect = self._target_rect()
+        if rect is None:
+            return
+        p = QPainter(self)
+        p.fillRect(self.rect(), QColor("#222"))
+        p.setClipRect(rect)
+        p.setRenderHint(QPainter.SmoothPixmapTransform, True)
+        if self._checker:
+            if self._checker_tile is None:
+                from gui_frame_matting import _checker_tile
+                self._checker_tile = _checker_tile(12)
+            p.drawTiledPixmap(rect, self._checker_tile)
+        if self._layer_below is None:
+            # 普通模式（精灵图预览）：单张 _pix，同样支持缩放/平移
+            p.drawPixmap(rect, self._pix,
+                         QRectF(0, 0, self._pix.width(), self._pix.height()))
+            p.end()
+            return
+        pw = self._layer_below.width()
+        ph = self._layer_below.height()
+        full = QRectF(0, 0, pw, ph)
+        p.drawPixmap(rect, self._layer_below, full)
+        if self._layer_sel is not None and self._sel_rect is not None:
+            sx, sy, sw, sh = self._sel_rect
+            kx, ky = rect.width() / pw, rect.height() / ph
+            p.drawPixmap(
+                QRectF(rect.x() + sx * kx, rect.y() + sy * ky,
+                       sw * kx, sh * ky),
+                self._layer_sel, QRectF(0, 0, sw, sh))
+        if self._layer_above is not None:
+            p.drawPixmap(rect, self._layer_above, full)
+        p.end()
+
     def _render(self):
+        # 两种模式统一走 paintEvent 自绘（支持视图缩放/平移）
         if self._pix is None or self._pix.isNull():
             self._disp_rect = None
             self.clear()
+            self.update()
             return
-        scaled = self._pix.scaled(self.size(), Qt.KeepAspectRatio,
-                                  Qt.SmoothTransformation)
-        x = (self.width() - scaled.width()) // 2
-        y = (self.height() - scaled.height()) // 2
-        self._disp_rect = (x, y, scaled.width(), scaled.height())
-        self.setPixmap(compose_checkerboard(scaled)
-                       if self._checker else scaled)
+        self._rect_key = None
+        self.update()
 
     def mousePressEvent(self, e):
-        if e.button() == Qt.LeftButton and self._disp_rect:
+        if e.button() == Qt.MiddleButton and self._disp_rect:
+            self._pan_last = e.position()
+            self.setCursor(Qt.ClosedHandCursor)
+        elif e.button() == Qt.LeftButton and self._disp_rect:
             self._last = e.position()
             self.setCursor(Qt.ClosedHandCursor if self.tool == "move"
                            else Qt.SizeAllCursor)
+            self.drag_started.emit()
         super().mousePressEvent(e)
 
     def mouseMoveEvent(self, e):
-        if self._last is not None and self._disp_rect:
+        if self._pan_last is not None:
+            pos = e.position()
+            self._pan_x += pos.x() - self._pan_last.x()
+            self._pan_y += pos.y() - self._pan_last.y()
+            self._pan_last = pos
+            self._rect_key = None
+            self.update()
+        elif self._last is not None and self._disp_rect:
             pos = e.position()
             dx, dy = pos.x() - self._last.x(), pos.y() - self._last.y()
             self._last = pos
@@ -93,11 +252,20 @@ class WorkspaceCanvas(FitImageLabel):
         super().mouseMoveEvent(e)
 
     def mouseReleaseEvent(self, e):
-        if self._last is not None:
+        if e.button() == Qt.MiddleButton and self._pan_last is not None:
+            self._pan_last = None
+            self.set_tool(self.tool)
+        elif self._last is not None:
             self._last = None
             self.set_tool(self.tool)
             self.drag_finished.emit()
         super().mouseReleaseEvent(e)
+
+    def mouseDoubleClickEvent(self, e):
+        if e.button() == Qt.LeftButton and \
+                (self._zoom != 1.0 or self._pan_x or self._pan_y):
+            self.zoom_reset()
+        super().mouseDoubleClickEvent(e)
 
 
 # ===================== 导出工作线程 =====================
@@ -187,7 +355,7 @@ class _ExportWorker(QThread):
 
 class _PreviewLoader(QThread):
     """把所有帧解码并缩小缓存，避免预览每次读全分辨率"""
-    loaded_one = Signal(str, object)
+    loaded_one = Signal(str, object, float)   # key, 缓存BGRA, 缓存/原尺寸系数
     done = Signal()
 
     def __init__(self, items: List[dict], max_side: int = 360):
@@ -212,17 +380,18 @@ class _PreviewLoader(QThread):
                 img = cv2.resize(img, (max(1, int(w * f)),
                                        max(1, int(h * f))),
                                  interpolation=cv2.INTER_AREA)
-            self.loaded_one.emit(it["key"], img)
+            self.loaded_one.emit(it["key"], img, f)
         self.done.emit()
 
 
 # ===================== 图层行（眼睛+缩略图+名称+缩放） =====================
 
 class LayerRow(QFrame):
-    """所有图片列表中的一行：👁 显示开关 + 缩略图 + 名称尺寸 + 独立缩放%"""
+    """所有图片列表中的一行：👁 显示开关 + 缩略图 + 名称尺寸 + 撤销 + 独立缩放%"""
     clicked = Signal(str)
     scale_changed = Signal(str, int)
     visibility_changed = Signal(str, bool)
+    undo_clicked = Signal(str)
 
     def __init__(self, key: str, number: int, w: int, h: int,
                  pct: int, visible: bool = True):
@@ -263,6 +432,21 @@ class LayerRow(QFrame):
         self.name_lab.setToolTip(key)
         lay.addWidget(self.name_lab, 1)
 
+        # 本张图片独立撤销（移动/缩放）
+        self.btn_undo = QToolButton()
+        self.btn_undo.setText("↩")
+        self.btn_undo.setFixedSize(28, 28)
+        self.btn_undo.setCursor(Qt.PointingHandCursor)
+        self.btn_undo.setEnabled(False)
+        self.btn_undo.setStyleSheet(
+            "QToolButton{background:transparent;border:none;"
+            "font-size:15px;color:#ecf0f1;}"
+            "QToolButton:hover{background:#3a3a3a;border-radius:4px;}"
+            "QToolButton:disabled{color:#555;}")
+        self.btn_undo.clicked.connect(
+            lambda: self.undo_clicked.emit(self.key))
+        lay.addWidget(self.btn_undo)
+
         self.spin = QSpinBox()
         self.spin.setRange(5, 400)
         self.spin.setValue(pct)
@@ -295,6 +479,12 @@ class LayerRow(QFrame):
     def is_visible(self) -> bool:
         return self._visible
 
+    def set_undo_count(self, n: int):
+        self.btn_undo.setEnabled(n > 0)
+        self.btn_undo.setToolTip(
+            f"撤销该图片上一次移动/缩放（可撤销 {n} 步）" if n
+            else "该图片暂无可撤销的移动/缩放")
+
     def set_thumbnail(self, bgra: np.ndarray):
         pm = bgra_to_pixmap(bgra)
         if pm is None or pm.isNull():
@@ -324,7 +514,7 @@ class LayerRow(QFrame):
 class FrameExportPage(QWidget):
 
     PREVIEW_MAX = 1500       # 预览最长边像素
-    PREVIEW_CACHE = 360      # 单帧预览缓存最长边
+    PREVIEW_CACHE = 1000     # 单帧预览缓存最长边（过小于此会放大模糊）
 
     def __init__(self, shared_state: dict):
         super().__init__()
@@ -338,26 +528,36 @@ class FrameExportPage(QWidget):
         self.items: List[dict] = []
         self._batch_id = ""
         self._batch_mark: Optional[float] = None
-        self.preview_cache: Dict[str, np.ndarray] = {}
+        self.preview_cache: Dict[str, Tuple[np.ndarray, float]] = {}
         self.selected_key: Optional[str] = None
         self.layer_rows: List[LayerRow] = []
         self._layer_scales: Dict[str, int] = {}
         self._layer_visible: Dict[str, bool] = {}
         self._layer_offsets: Dict[str, List[float]] = {}   # 相对居中偏移
+        # 每张图片独立撤销栈：key -> [(缩放%, ox, oy), ...]（变更前的状态）
+        self._undo: Dict[str, List[Tuple[int, float, float]]] = {}
+        self._undo_coalesce: Dict[str, float] = {}         # spin 连调合并时间戳
+        self._drag_pending: Optional[str] = None           # 拖拽事务待入栈的 key
+        self._ws_cache: Optional[dict] = None              # 静态图层合成缓存
         self.loader: Optional[_PreviewLoader] = None
         self.worker: Optional[_ExportWorker] = None
 
         # 预览/持久化防抖（须在 _build_ui 前创建，画布连接用到）
         self._preview_timer = QTimer(self)
         self._preview_timer.setSingleShot(True)
-        self._preview_timer.setInterval(90)
+        self._preview_timer.setInterval(24)
         self._preview_timer.timeout.connect(self._render_preview)
         self._save_timer = QTimer(self)
         self._save_timer.setSingleShot(True)
         self._save_timer.setInterval(300)
         self._save_timer.timeout.connect(self._write_info)
+        self._resize_timer = QTimer(self)
+        self._resize_timer.setSingleShot(True)
+        self._resize_timer.setInterval(150)
+        self._resize_timer.timeout.connect(self._on_view_resized)
 
         self._build_ui()
+        QShortcut(QKeySequence("Ctrl+Z"), self, self._undo_selected)
 
     # ---------- UI ----------
 
@@ -370,8 +570,10 @@ class FrameExportPage(QWidget):
         left_box = QGroupBox("工作台（棋盘格=透明，选中图片后用工具拖拽）")
         lv = QVBoxLayout(left_box)
         self.view = WorkspaceCanvas(checker=True)
+        self.view.drag_started.connect(self._on_drag_started)
         self.view.drag_delta.connect(self._on_canvas_drag)
-        self.view.drag_finished.connect(self._save_timer.start)
+        self.view.drag_finished.connect(self._on_drag_finished)
+        self.view.resized.connect(self._resize_timer.start)
         lv.addWidget(self.view, 1)
         self.info_label = QLabel("尚未加载图片")
         self.info_label.setStyleSheet("color:#f1c40f;font-size:12px;")
@@ -417,11 +619,49 @@ class FrameExportPage(QWidget):
         rowt.addWidget(self.btn_tool_move)
         rowt.addWidget(self.btn_tool_scale)
         btn_zero = QPushButton("位置归零")
-        btn_zero.setToolTip("选中图片回到画布中心")
+        btn_zero.setToolTip("选中图片回到画布中心（可撤销）")
         btn_zero.clicked.connect(self._reset_selected_offset)
         rowt.addWidget(btn_zero)
+        self.btn_undo_sel = QPushButton("↩ 撤销本图")
+        self.btn_undo_sel.setToolTip(
+            "撤销选中图片的上一次移动/缩放（Ctrl+Z，各图独立）")
+        self.btn_undo_sel.clicked.connect(self._undo_selected)
+        self.btn_undo_sel.setEnabled(False)
+        rowt.addWidget(self.btn_undo_sel)
         rowt.addStretch()
+        self.btn_import = QPushButton("📥 导入图片…")
+        self.btn_import.setToolTip(
+            "把外部 PNG 图片复制进当前批次，作为新图层参与工作台与导出")
+        self.btn_import.clicked.connect(self._import_images)
+        rowt.addWidget(self.btn_import)
         tf.addLayout(rowt)
+
+        # 视图缩放：滚轮以鼠标为锚缩放，中键拖拽平移，双击复位
+        rowz = QHBoxLayout()
+        rowz.addWidget(QLabel("视图："))
+        btn_zoom_out = QToolButton()
+        btn_zoom_out.setText("➖")
+        btn_zoom_out.setToolTip("缩小预览（滚轮↓）")
+        btn_zoom_out.clicked.connect(lambda: self.view.zoom_step(0.8))
+        rowz.addWidget(btn_zoom_out)
+        self.zoom_label = QLabel("100%")
+        self.zoom_label.setFixedWidth(46)
+        self.zoom_label.setAlignment(Qt.AlignCenter)
+        rowz.addWidget(self.zoom_label)
+        btn_zoom_in = QToolButton()
+        btn_zoom_in.setText("➕")
+        btn_zoom_in.setToolTip("放大预览（滚轮↑）")
+        btn_zoom_in.clicked.connect(lambda: self.view.zoom_step(1.25))
+        rowz.addWidget(btn_zoom_in)
+        btn_fit = QPushButton("适配窗口")
+        btn_fit.setToolTip("复位缩放与平移（双击画布同效）")
+        btn_fit.clicked.connect(self.view.zoom_reset)
+        rowz.addWidget(btn_fit)
+        rowz.addWidget(QLabel("｜滚轮缩放 / 中键平移"))
+        rowz.addStretch()
+        self.view.zoom_changed = lambda pct: \
+            self.zoom_label.setText(f"{pct}%")
+        tf.addLayout(rowz)
 
         rowc = QHBoxLayout()
         self.chk_canvas_auto = QCheckBox("画板自动（取最大帧）")
@@ -499,6 +739,8 @@ class FrameExportPage(QWidget):
         self.size_label.setStyleSheet("color:#2ecc71;")
         row3.addWidget(self.size_label, 1)
         self.chk_sprite_preview = QCheckBox("预览精灵图")
+        self.chk_sprite_preview.toggled.connect(
+            lambda *_: self.view.zoom_reset())
         self.chk_sprite_preview.toggled.connect(self._render_preview)
         row3.addWidget(self.chk_sprite_preview)
         sf.addLayout(row3)
@@ -571,6 +813,54 @@ class FrameExportPage(QWidget):
 
         root.addLayout(right, 8)
 
+    # ---------- 导入图片 ----------
+
+    def _import_images(self):
+        """把外部 PNG 复制进当前批次的 matted 目录，作为新图层参与导出"""
+        if not self.matted_dir or not os.path.isdir(self.matted_dir):
+            self.status_text("请先完成批量抠图，建立当前批次后再导入")
+            return
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "选择要导入的 PNG 图片", "",
+            "PNG 图片 (*.png)")
+        if not paths:
+            return
+        imported, skipped, failed = [], [], []
+        existing = set(os.listdir(self.matted_dir))
+        for path in paths:
+            fn = os.path.basename(path)
+            if not fn.lower().endswith(".png"):
+                skipped.append(fn)
+                continue
+            # 与现有文件同名时自动改名，避免覆盖批次原图
+            name, ext = os.path.splitext(fn)
+            cand = fn
+            n = 1
+            while cand in existing:
+                cand = f"{name}_{n}{ext}"
+                n += 1
+            if eu.load_bgra(path) is None:
+                failed.append(fn)
+                continue
+            try:
+                shutil.copy2(path, os.path.join(self.matted_dir, cand))
+                existing.add(cand)
+                imported.append(cand)
+            except OSError:
+                failed.append(fn)
+        if imported:
+            # 批次签名变化 → 触发整体重载，新图层自动带独立变换/撤销
+            self._reload_if_changed()
+            self.status_text(
+                f"已导入 {len(imported)} 张：{'、'.join(imported)}"
+                + (f"；跳过非 PNG {len(skipped)} 张" if skipped else "")
+                + (f"；读取失败 {len(failed)} 张" if failed else ""))
+        else:
+            self.status_text(
+                "没有可导入的 PNG"
+                + (f"（跳过非 PNG {len(skipped)} 张）" if skipped else "")
+                + (f"（读取失败 {len(failed)} 张）" if failed else ""))
+
     # ---------- 批次/加载 ----------
 
     def showEvent(self, event):
@@ -623,6 +913,11 @@ class FrameExportPage(QWidget):
                 pass
 
         self.items = []
+        # 重新加载（含批次变化）：变换撤销历史只保留在内存中，整体丢弃
+        self._undo = {}
+        self._undo_coalesce = {}
+        self._drag_pending = None
+        self._ws_cache = None
         for i, fn in enumerate(files, 1):
             src, stage = self._best_source(fn, colored_dir,
                                            refined_dir, matted_dir)
@@ -720,6 +1015,11 @@ class FrameExportPage(QWidget):
         self.items, self.layer_rows = [], []
         self._batch_id = ""
         self.preview_cache = {}
+        self._undo = {}
+        self._undo_coalesce = {}
+        self._drag_pending = None
+        self._ws_cache = None
+        self._update_undo_ui()
         self.view.set_image(None)
         self.info_label.setText(text)
         self.size_label.setText("输出尺寸：-")
@@ -738,6 +1038,7 @@ class FrameExportPage(QWidget):
             self.loader.stop()
             self.loader.wait(2000)
         self.preview_cache = {}
+        self._ws_cache = None
         self.loader = _PreviewLoader(self.items, self.PREVIEW_CACHE)
         self.loader.loaded_one.connect(self._on_preview_one)
         self.loader.done.connect(self._render_preview)
@@ -749,8 +1050,8 @@ class FrameExportPage(QWidget):
         self.btn_export_sprite.setEnabled(True)
         self.btn_export_psd.setEnabled(True)
 
-    def _on_preview_one(self, key: str, img: np.ndarray):
-        self.preview_cache[key] = img
+    def _on_preview_one(self, key: str, img: np.ndarray, factor: float):
+        self.preview_cache[key] = (img, factor)
         for r in self.layer_rows:
             if r.key == key:
                 r.set_thumbnail(img)
@@ -771,15 +1072,95 @@ class FrameExportPage(QWidget):
                     max(it["h"] for it in self.items))
         return (self.spn_cw.value(), self.spn_ch.value())
 
+    # ---------- 每图独立撤销（移动/缩放变换） ----------
+
+    UNDO_LIMIT = 50
+
+    def _layer_transform(self, key: str) -> Tuple[int, float, float]:
+        pct = int(self._layer_scales.get(key, 100))
+        ox, oy = self._layer_offsets.get(key, (0.0, 0.0))
+        return pct, float(ox), float(oy)
+
+    def _push_undo(self, key: str, mark_coalesce: bool = True):
+        """把该图【当前】变换状态作为撤销点入栈（在改动之前调用）"""
+        snap = self._layer_transform(key)
+        st = self._undo.setdefault(key, [])
+        if st and st[-1] == snap:
+            return                      # 与栈顶相同，不入重复点
+        st.append(snap)
+        if len(st) > self.UNDO_LIMIT:
+            del st[:-self.UNDO_LIMIT]
+        if mark_coalesce:
+            self._undo_coalesce[key] = time.monotonic()
+        self._update_undo_ui()
+
+    def _undo_layer(self, key: Optional[str]):
+        if not key:
+            return
+        st = self._undo.get(key)
+        if not st:
+            return
+        pct, ox, oy = st.pop()
+        if not st:
+            self._undo.pop(key, None)      # 栈空后移除，保持字典干净
+        self._layer_scales[key] = pct
+        if ox == 0.0 and oy == 0.0:
+            self._layer_offsets.pop(key, None)
+        else:
+            self._layer_offsets[key] = [ox, oy]
+        row = next((r for r in self.layer_rows if r.key == key), None)
+        if row is not None:
+            row.spin.blockSignals(True)
+            row.spin.setValue(pct)
+            row.spin.blockSignals(False)
+        self._undo_coalesce[key] = time.monotonic()
+        self._ws_cache = None
+        self._update_undo_ui()
+        self._schedule_preview()
+        self._save_timer.start()
+        self.status_text(
+            f"{key} 已撤销上一步移动/缩放（本图剩 {len(st)} 步）")
+
+    def _undo_selected(self):
+        self._undo_layer(self.selected_key)
+
+    def _update_undo_ui(self):
+        for r in self.layer_rows:
+            r.set_undo_count(len(self._undo.get(r.key, ())))
+        n = len(self._undo.get(self.selected_key, ())) \
+            if self.selected_key else 0
+        self.btn_undo_sel.setEnabled(n > 0)
+        self.btn_undo_sel.setText(f"↩ 撤销本图（{n}）" if n else "↩ 撤销本图")
+
+    # ---------- 画布拖拽交互 ----------
+
+    def _on_drag_started(self):
+        # 首个实际变化时才入栈，纯点击不留无效撤销点
+        if self.selected_key and not self.chk_sprite_preview.isChecked():
+            self._drag_pending = self.selected_key
+
+    def _on_drag_finished(self):
+        self._drag_pending = None
+        self._save_timer.start()
+
+    def _on_view_resized(self):
+        if self.items:
+            self._ws_cache = None      # 预览分辨率随控件变化，缓存失效
+            self._render_preview()
+
     def _on_canvas_drag(self, dx: float, dy: float):
         """移动工具=拖动选中图层位置；缩放工具=横向拖拽调大小"""
         key = self.selected_key
         if not key:
             return
+        if self._drag_pending == key:
+            self._push_undo(key)       # 拖拽事务首个变化：入栈一次
+            self._drag_pending = None
         if self.view.tool == "move":
             ox, oy = self._layer_offsets.get(key, (0.0, 0.0))
             self._layer_offsets[key] = [ox + dx, oy + dy]
-            self._schedule_preview()
+            # 拖拽中静态层命中缓存，单帧仅 ~3ms，立即跟手渲染
+            self._render_preview()
         else:
             row = next((r for r in self.layer_rows if r.key == key), None)
             if row is not None:
@@ -791,10 +1172,12 @@ class FrameExportPage(QWidget):
     def _reset_selected_offset(self):
         key = self.selected_key
         if key and key in self._layer_offsets:
+            self._push_undo(key)
             del self._layer_offsets[key]
+            self._ws_cache = None
             self._schedule_preview()
             self._save_timer.start()
-            self.status_text(f"{key} 已回到画布中心")
+            self.status_text(f"{key} 已回到画布中心（可撤销）")
 
     def _sprite_params(self) -> dict:
         return {
@@ -855,14 +1238,17 @@ class FrameExportPage(QWidget):
             row.clicked.connect(self._select_layer)
             row.scale_changed.connect(self._on_layer_scale_changed)
             row.visibility_changed.connect(self._on_layer_visibility)
+            row.undo_clicked.connect(self._undo_layer)
             self.layer_layout.insertWidget(self.layer_layout.count() - 1, row)
             self.layer_rows.append(row)
         self._sync_row_selection()
+        self._update_undo_ui()
 
     def _select_layer(self, key: str):
         self.selected_key = key
         self.chk_sprite_preview.setChecked(False)
         self._sync_row_selection()
+        self._update_undo_ui()
         self._render_preview()
 
     def _sync_row_selection(self):
@@ -870,8 +1256,18 @@ class FrameExportPage(QWidget):
             r.set_selected(r.key == self.selected_key)
 
     def _on_layer_scale_changed(self, key: str, pct: int):
+        # 键盘连按/滚轮/拖拽产生的连续变化合并为一个撤销点
+        now = time.monotonic()
+        if now - self._undo_coalesce.get(key, 0.0) > 0.8:
+            self._push_undo(key)
+        self._undo_coalesce[key] = now
         self._layer_scales[key] = pct
-        self._schedule_preview()
+        # 选中层缩放只重画它自己（静态缓存命中），立即跟手；
+        # 非选中层缩放改变静态签名，走防抖重建
+        if key == self.selected_key:
+            self._render_preview()
+        else:
+            self._schedule_preview()
         self._save_timer.start()
 
     def _on_layer_visibility(self, key: str, visible: bool):
@@ -891,15 +1287,27 @@ class FrameExportPage(QWidget):
 
     def _apply_scale_all(self):
         v = self.spn_all.value()
+        changed = 0
         for r in self.layer_rows:
-            r.spin.setValue(v)      # 触发 changed → 写 dict / 刷新
-        self.status_text(f"已把全部图层缩放设为 {v}%")
+            if r.spin.value() != v:
+                self._push_undo(r.key)    # 入栈旧值并抑制连调重复入栈
+                r.spin.setValue(v)        # 触发 changed → 写 dict / 刷新
+                changed += 1
+        self.status_text(
+            f"已把 {changed} 个图层缩放设为 {v}%（各图可单独撤销）"
+            if changed else f"全部图层已是 {v}%")
 
     def _reset_scale_all(self):
+        changed = 0
         for r in self.layer_rows:
-            r.spin.setValue(100)
+            if r.spin.value() != 100:
+                self._push_undo(r.key)
+                r.spin.setValue(100)
+                changed += 1
         self.spn_all.setValue(100)
-        self.status_text("全部图层缩放已恢复 100%")
+        self.status_text(
+            f"已将 {changed} 个图层缩放恢复 100%（各图可单独撤销）"
+            if changed else "全部图层已是 100%")
 
     # ---------- 工作台渲染 ----------
 
@@ -912,8 +1320,15 @@ class FrameExportPage(QWidget):
         else:
             self._render_workspace()
 
-    def _ready_images(self) -> Dict[str, np.ndarray]:
-        return {k: v for k, v in self.preview_cache.items()}
+    def _ready_images(self) -> Dict[str, Tuple[np.ndarray, float]]:
+        return dict(self.preview_cache)
+
+    def _workspace_preview_factor(self, cw: int, ch: int) -> float:
+        """预览分辨率按控件实际显示尺寸走（封顶 PREVIEW_MAX），避免超渲染"""
+        vw = max(1, self.view.width())
+        vh = max(1, self.view.height())
+        target = min(float(self.PREVIEW_MAX), float(max(vw, vh)))
+        return min(1.0, target / max(1.0, float(max(cw, ch))))
 
     def _render_workspace(self):
         """PS 式工作台：合成所有可见图层（含独立缩放与位置偏移）"""
@@ -922,27 +1337,78 @@ class FrameExportPage(QWidget):
             return
         cw, ch = self._canvas_size()
         self.view.canvas_wh = (cw, ch)
-        # 预览用小图等比计算画布
-        pf = min(1.0, self.PREVIEW_MAX / max(1.0, max(cw, ch)))
+        pf = self._workspace_preview_factor(cw, ch)
         pw = max(1, int(cw * pf))
         ph = max(1, int(ch * pf))
-        canvas = np.zeros((ph, pw, 4), np.uint8)
-        shown = 0
-        for it in self.items:
-            if not self._layer_visible.get(it["key"], True):
-                continue
-            im = cache.get(it["key"])
-            if im is None:
-                continue
+        sel = self.selected_key
+        sel_idx = next((i for i, it in enumerate(self.items)
+                        if it["key"] == sel), -1)
+
+        def place(it: dict):
+            """缩放后图层 + 它在预览画布上的左上角坐标"""
+            im, cf = cache[it["key"]]
             pct = self._layer_scales.get(it["key"], 100) / 100.0
-            sim = eu.scale_bgra(im, pct * pf)
+            sim = eu.scale_bgra(im, pct * pf / cf)
             x, y = eu.centered_xy(pw, ph, sim.shape[1], sim.shape[0])
             ox, oy = self._layer_offsets.get(it["key"], (0.0, 0.0))
-            eu.flatten_over(canvas, sim,
-                            x + int(round(ox * pf)),
-                            y + int(round(oy * pf)))
+            return sim, x + int(round(ox * pf)), y + int(round(oy * pf))
+
+        # 除选中层外全部是静态层：签名不变（=正在拖拽选中层）时直接复用
+        static_sig = (
+            pw, ph, sel, tuple(sorted(cache.keys())),
+            tuple((it["key"],
+                   self._layer_scales.get(it["key"], 100),
+                   round(float(self._layer_offsets.get(
+                       it["key"], (0.0, 0.0))[0]), 2),
+                   round(float(self._layer_offsets.get(
+                       it["key"], (0.0, 0.0))[1]), 2),
+                   self._layer_visible.get(it["key"], True))
+                  for it in self.items if it["key"] != sel))
+        wc = self._ws_cache
+        if wc is None or wc.get("sig") != static_sig:
+            # 静态层分两条链（均为 flatten_over 同口径缓冲）：
+            # below = 选中层以下；above = 选中层以上。二者缓存为 QPixmap，
+            # 拖拽帧只重画选中层，最终 over 合成交给 QPainter。
+            below = np.zeros((ph, pw, 4), np.uint8)
+            above = None
+            shown = 0
+            for i, it in enumerate(self.items):
+                if it["key"] == sel:
+                    continue
+                if not self._layer_visible.get(it["key"], True):
+                    continue
+                if cache.get(it["key"]) is None:
+                    continue
+                sim, px, py = place(it)
+                if sel_idx < 0 or i < sel_idx:
+                    eu.flatten_over(below, sim, px, py)
+                else:
+                    if above is None:
+                        above = np.zeros((ph, pw, 4), np.uint8)
+                    eu.flatten_over(above, sim, px, py)
+                shown += 1
+            anchor = QPixmap(pw, ph)
+            anchor.fill(Qt.transparent)
+            wc = {"sig": static_sig,
+                  "anchor": anchor,
+                  "below_pm": bgra_to_pixmap(below, checker=False),
+                  "above_pm": bgra_to_pixmap(above, checker=False)
+                  if above is not None else None,
+                  "static_shown": shown}
+            self._ws_cache = wc
+
+        shown = wc["static_shown"]
+        sel_pm = None
+        sel_rect = None
+        if (sel_idx >= 0 and sel in cache
+                and self._layer_visible.get(sel, True)):
+            sim, px, py = place(self.items[sel_idx])
+            sel_pm = bgra_to_pixmap(sim, checker=False)
+            sel_rect = (px, py, sim.shape[1], sim.shape[0])
             shown += 1
-        self.view.set_image(bgra_to_pixmap(canvas))
+        self.view.set_workspace_layers(
+            wc["anchor"], wc["below_pm"], wc["above_pm"],
+            sel_pm, sel_rect)
         total = len(self.items)
         hidden = total - len(self._visible_items())
         sel = self.selected_key or "-"
@@ -961,21 +1427,24 @@ class FrameExportPage(QWidget):
             return
         p = self._sprite_params()
         user_scale = p["sprite_scale"] / 100.0
-        base_sizes = [(im.shape[1], im.shape[0]) for _, im in ready]
-        W0, H0, _, _ = eu.sprite_sheet_size(
-            base_sizes,
-            columns=0 if p["auto_columns"] else p["columns"],
-            scale=1.0, padding=p["padding"])
-        pf = min(1.0, self.PREVIEW_MAX
-                 / max(1.0, max(W0, H0) * user_scale))
+        cols_arg = 0 if p["auto_columns"] else p["columns"]
+        # 用各帧原始尺寸推算全分辨率输出，再整体缩到预览上限
+        W0, H0, cols, rows = eu.sprite_sheet_size(
+            [(it["w"], it["h"]) for it, _ in ready],
+            columns=cols_arg, scale=user_scale, padding=p["padding"])
+        target = min(float(self.PREVIEW_MAX),
+                     float(max(1, self.view.width(), self.view.height())))
+        pf = min(1.0, target / max(1.0, max(W0, H0)))
+        sims = []
+        for it, (im, cf) in ready:
+            sims.append(eu.scale_bgra(im, user_scale * pf / cf))
         sheet, _ = eu.build_sprite_sheet(
-            [im for _, im in ready],
-            columns=0 if p["auto_columns"] else p["columns"],
-            scale=user_scale * pf, padding=max(1, int(p["padding"] * pf)))
-        self.view.set_image(bgra_to_pixmap(sheet))
+            sims, columns=cols_arg, scale=1.0,
+            padding=max(0, int(round(p["padding"] * pf))))
+        self.view.set_image(bgra_to_pixmap(sheet, checker=False))
         self.info_label.setText(
-            f"精灵图预览（{len(ready)} 个可见帧，"
-            f"预览缩放 {user_scale * pf:.2f}×）")
+            f"精灵图预览（{len(ready)} 个可见帧，{cols}列×{rows}行，"
+            f"输出 {W0}×{H0}，预览缩放 {pf:.2f}×）")
 
     # ---------- 导出 ----------
 

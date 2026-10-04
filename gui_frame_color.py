@@ -287,8 +287,8 @@ class FitImageLabel(QLabel):
                        if self._checker else scaled)
 
 
-def bgra_to_pixmap(bgra: np.ndarray) -> QPixmap:
-    """BGRA numpy → QPixmap"""
+def bgra_to_pixmap(bgra: np.ndarray, checker: bool = True) -> QPixmap:
+    """BGRA numpy → QPixmap。checker=False 时保留透明通道（由显示控件铺棋盘格）"""
     from PySide6.QtGui import QImage, QPainter
     if bgra.shape[2] == 3:
         rgb = cv2.cvtColor(bgra, cv2.COLOR_BGR2RGB)
@@ -300,6 +300,8 @@ def bgra_to_pixmap(bgra: np.ndarray) -> QPixmap:
         h, w = rgba.shape[:2]
         qimg = QImage(rgba.data, w, h, 4 * w,
                       QImage.Format_RGBA8888).copy()
+        if not checker:
+            return QPixmap.fromImage(qimg)
         # 先铺棋盘格，透明区可见
         pix = QPixmap.fromImage(qimg)
         canvas = QPixmap(pix.size())
