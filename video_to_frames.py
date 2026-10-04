@@ -15,6 +15,7 @@
 import argparse
 import json
 import os
+import shutil
 import sys
 from dataclasses import dataclass, asdict
 from typing import List, Optional, Tuple
@@ -113,6 +114,13 @@ def extract_frames(
                 os.remove(os.path.join(output_dir, fn))
             except OSError:
                 pass
+
+    # 清理下游模块产物（批量抠图 matted/、图片精抠 refined/），
+    # 否则换新视频重新抽帧后，旧视频的抠图/精抠图片会残留并被下游页面读到
+    for sub in ("matted", "refined"):
+        sub_dir = os.path.join(output_dir, sub)
+        if os.path.isdir(sub_dir):
+            shutil.rmtree(sub_dir, ignore_errors=True)
 
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():

@@ -431,6 +431,7 @@ class FrameMattingPage(QWidget):
         self.cells: List[MattedCell] = []
         self.results: Dict[int, str] = {}   # 帧索引 -> 抠图输出路径
         self.frames_dir: str = ""
+        self._frames_sig: str = ""        # 帧目录内容签名（换视频重抽时变化）
         self.output_dir: str = ""
         self.selected: set = set()          # 来自帧数选择的帧索引
         self.cur_index: int = -1
@@ -455,12 +456,33 @@ class FrameMattingPage(QWidget):
     def showEvent(self, event):
         super().showEvent(event)
         d = self.shared_state.get("frames_dir", "")
-        if d and os.path.isdir(d) and d != self.frames_dir:
-            self.dir_edit.setText(d)
-            self._load_frames(d)
-        elif self.frames:
-            # 同一目录：用户可能刚在帧数选择页改过选择，每次进入都刷新
-            self._refresh_selection()
+        if d and os.path.isdir(d):
+            sig = self._frames_signature(d)
+            if d != self.frames_dir or sig != self._frames_sig:
+                # 换了帧目录，或同一目录被重新抽帧（签名变化）→ 完整重载，
+                # 清掉旧视频的帧列表/抠图结果缓存
+                self.dir_edit.setText(d)
+                self._load_frames(d)
+            elif self.frames:
+                # 同一批帧：用户可能刚在帧数选择页改过选择，每次进入都刷新
+                self._refresh_selection()
+
+    @staticmethod
+    def _frames_signature(directory: str) -> str:
+        """帧目录内容签名：优先 frames_info.json 修改时间，否则用文件名清单"""
+        info_path = os.path.join(directory, "frames_info.json")
+        if os.path.isfile(info_path):
+            try:
+                return f"info:{os.path.getmtime(info_path):.3f}"
+            except OSError:
+                pass
+        exts = (".png", ".jpg", ".jpeg", ".bmp", ".webp")
+        try:
+            return "files:" + "|".join(
+                sorted(f for f in os.listdir(directory)
+                       if f.lower().endswith(exts)))
+        except OSError:
+            return ""
 
     def _read_selected(self) -> set:
         """读取选中帧索引：优先内存共享（实时），其次 selected_frames.json"""
@@ -836,6 +858,7 @@ class FrameMattingPage(QWidget):
         self.selected = set()
         self.cur_index = -1
         self.cur_image = None
+        self._frames_sig = self._frames_signature(directory)
 
         # 输出目录默认值
         out = self.out_edit.text().strip()
