@@ -635,8 +635,8 @@ class FrameMattingPage(QWidget):
         feather_row.addWidget(QLabel("羽化:"))
         self.feather_slider = QSlider(Qt.Horizontal)
         self.feather_slider.setRange(0, 10)
-        self.feather_slider.setValue(1)
-        self.feather_label = QLabel("1")
+        self.feather_slider.setValue(2)
+        self.feather_label = QLabel("2")
         self.feather_label.setMinimumWidth(30)
         self.feather_slider.valueChanged.connect(
             lambda v: self.feather_label.setText(str(v)))
@@ -661,8 +661,8 @@ class FrameMattingPage(QWidget):
         clean_row.addWidget(QLabel("边缘净化:"))
         self.clean_slider = QSlider(Qt.Horizontal)
         self.clean_slider.setRange(0, 200)
-        self.clean_slider.setValue(20)
-        self.clean_label = QLabel("20%")
+        self.clean_slider.setValue(50)
+        self.clean_label = QLabel("50%")
         self.clean_label.setMinimumWidth(34)
         self.clean_slider.valueChanged.connect(
             lambda v: self.clean_label.setText(f"{v}%"))
