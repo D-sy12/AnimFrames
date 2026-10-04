@@ -461,7 +461,7 @@ class FrameColorPage(QWidget):
         self.rb_hist.setChecked(True)
         self.rb_reinhard.setToolTip("Lab 空间对齐均值/标准差，色调自然")
         self.rb_hist.setToolTip("逐通道匹配直方图分布，对齐更强")
-        for rb in (self.rb_reinhard, self.rb_hist):
+        for rb in (self.rb_hist, self.rb_reinhard):
             self.method_group.addButton(rb)
             method_row.addWidget(rb)
             rb.toggled.connect(self._schedule_preview)
