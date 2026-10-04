@@ -6,8 +6,9 @@
   1. 视频导帧
   2. 帧数选择
   3. 批量抠图
-  4. 色调统一（开发中）
-  5. 导出图片（开发中）
+  4. 图片精抠
+  5. 色调统一（开发中）
+  6. 导出图片（开发中）
 
 运行：
     python main_app.py11
@@ -24,6 +25,7 @@ from PySide6.QtWidgets import (
 from gui_video_to_frames import VideoToFramesPage
 from gui_frame_selector import FrameSelectorPage
 from gui_frame_matting import FrameMattingPage
+from gui_frame_refine import FrameRefinePage
 
 
 # ===================== 占位页面（待开发模块） =====================
@@ -59,6 +61,7 @@ class MainApp(QMainWindow):
         ("video",     "视频导帧"),
         ("select",    "帧数选择"),
         ("matting",   "批量抠图"),
+        ("refine",    "图片精抠"),
         ("color",     "色调统一"),
         ("export",    "导出图片"),
     ]
@@ -129,13 +132,17 @@ class MainApp(QMainWindow):
         self.page_matting = FrameMattingPage(self.shared_state)
         self.stack.addWidget(self.page_matting)
 
-        # 页面 4：色调统一
+        # 页面 4：图片精抠
+        self.page_refine = FrameRefinePage(self.shared_state)
+        self.stack.addWidget(self.page_refine)
+
+        # 页面 5：色调统一
         self.page_color = PlaceholderPage(
             "色调统一",
             "以原图为基准，统一选中帧的色调（Reinhard 迁移 + 直方图匹配）")
         self.stack.addWidget(self.page_color)
 
-        # 页面 5：导出图片
+        # 页面 6：导出图片
         self.page_export = PlaceholderPage(
             "导出图片",
             "拼图 / 动画预览 / 分辨率调整 / 导出 PNG 序列或雪碧图")
