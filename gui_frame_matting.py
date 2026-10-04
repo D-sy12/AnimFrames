@@ -113,75 +113,38 @@ def border_connected_mask(seed: np.ndarray) -> np.ndarray:
     return np.isin(labels, edge_labels).astype(np.uint8)
 
 
-def despill_edges(bgr: np.ndarray, alpha: np.ndarray,
-                  colors: list, strength: float, slack: int = 6,
-                  band: int = 2) -> np.ndarray:
-    """
-    去溢色（抑制背景色在前景边缘的色晕，如绿边/蓝边）。
-    经典色键做法：背景色主导分量若高于另外两分量最大值+slack，把超出部分压回。
-    作用区：半透明像素 + 其外侧 band px 的不透明边缘（色边常落在不透明侧）。
-    白/灰像素 G≈R≈B，天然不受影响；远离边缘的像素不受影响。
-    strength: 0.0~2.0（100%=压平到参考线，>100%=压过头，用于顽固色边）
-    """
-    if strength <= 0:
-        return bgr
-    out = bgr.copy()
-    semi = (alpha > 0) & (alpha < 255)
-    if not semi.any():
-        return out
-    # 半透明边缘向外膨胀 band px，覆盖紧贴边缘的不透明溢色像素
-    zone = cv2.dilate(semi.astype(np.uint8),
-                      np.ones((band * 2 + 1, band * 2 + 1), np.uint8)).astype(bool)
-    zone &= alpha > 0
-    if not zone.any():
-        return out
-    # 半透明像素按透明度加权；不透明边缘像素满权（保证也能压下去）
-    w = np.where(alpha < 255,
-                 np.maximum(alpha.astype(np.float32) / 255.0, 0.25),
-                 1.0) * strength
-    for r0, g0, b0 in colors:
-        bg = np.array([b0, g0, r0], dtype=np.int16)   # BGR
-        dominant = int(np.argmax(bg))
-        others = [i for i in range(3) if i != dominant]
-        d = out[:, :, dominant].astype(np.int16)
-        ref = np.maximum(out[:, :, others[0]].astype(np.int16),
-                         out[:, :, others[1]].astype(np.int16))
-        over = np.clip(d - ref - slack, 0, 255).astype(np.float32)
-        new_d = np.clip(d - (over * w).astype(np.int16), 0, 255)
-        out[:, :, dominant] = np.where(
-            zone, new_d.astype(np.uint8), out[:, :, dominant])
-    return out
-
-
 def decontaminate_edges(bgr: np.ndarray, alpha: np.ndarray,
                         bg_bgr: np.ndarray, strength: float,
-                        a_floor: float = 0.03) -> np.ndarray:
+                        a_floor: float = 0.03,
+                        max_gain: float = 3.0) -> np.ndarray:
     """
     边缘净化：半透明边缘像素的观察色是 alpha 合成的结果
         C = a*F + (1-a)*B   （F 真实前景色，B 已知背景色）
-    已知 alpha 和 B 即可反解真实前景色：F = (C - (1-a)*B) / a。
+    已知 alpha 和 B 即可反解真实前景色：F = C + ((1-a)/a)*(C-B)。
     与"去溢色"只压背景色主导分量不同，本操作按合成原理把混入的
     背景色整体扣除，对深色、浅色、三分量接近的背景都有效。
-    alpha < a_floor 的像素反解数值不稳定，保持原色（视觉贡献可忽略）。
+    alpha 必须传入收缩/羽化前的原始 key alpha（能真实反映混合比例），
+    否则增益 (1-a)/a 被低估的 alpha 放大，反解会过冲成黑边/品红边。
+    增益同时受 max_gain 封顶，避免低 alpha 像素数值发散。
     strength: 0.0~2.0（100%=完全反解，>100% 过度外推用于顽固色边）。
     """
     if strength <= 0:
         return bgr
     a = alpha.astype(np.float32) / 255.0
-    semi = a >= a_floor
+    semi = (a >= a_floor) & (a < 0.997)
     if not semi.any():
         return bgr
     src = bgr.astype(np.float32)
-    af = np.maximum(a, 1e-3)[..., None]
-    est = (src - (1.0 - af) * bg_bgr) / af      # 反解前景色
+    gain = np.minimum((1.0 - a) / np.maximum(a, 1e-4), max_gain)
+    est = src + gain[..., None] * (src - bg_bgr)   # 反解前景色
     est = np.clip(est, 0.0, 255.0)
-    out = src + (est - src) * strength          # 按强度向净色靠拢
+    out = src + (est - src) * strength             # 按强度向净色靠拢
     out = np.where(semi[..., None], out, src)
     return np.clip(out, 0.0, 255.0).astype(np.uint8)
 
 
 def matte_bgcolor_array(bgr: np.ndarray, colors: list, tol: float,
-                        feather: int, choke: int, despill_pct: int,
+                        feather: int, choke: float,
                         protect_inner: bool,
                         edge_clean_pct: int = 0) -> np.ndarray:
     """
@@ -190,8 +153,7 @@ def matte_bgcolor_array(bgr: np.ndarray, colors: list, tol: float,
       2. 连通域保护：只抠除与画面边缘连通的背景，保留主体内部同色
       3. 边缘收缩(choke)：alpha 向内收 N px（0.5px 步进，亚像素），吃掉残留色边
       4. 羽化：高斯柔化收缩后的硬边
-      5. 去溢色(despill)：中和边缘的背景色晕（可 >100% 加强压制）
-      6. 边缘净化(clean)：按 alpha 合成公式反解半透明像素的真实前景色
+      5. 边缘净化(clean)：按 key alpha 合成公式反解半透明像素的真实前景色
     worker 批量处理与界面实时预览共用此函数。
     """
     need_clean = edge_clean_pct > 0 and bool(colors)
@@ -231,6 +193,8 @@ def matte_bgcolor_array(bgr: np.ndarray, colors: list, tol: float,
     # 3) 边缘收缩：距离变换实现亚像素收缩（0.5px 步进）。
     #    dist=像素到背景的距离；收缩 c px：dist<=c 处 alpha=0，
     #    dist∈(c, c+1) 线性过渡——c=1 时直线边缘与原 3x3 erode 等效
+    #    key_alpha：收缩/羽化前的原始 alpha，供边缘净化反解混合比例
+    key_alpha = alpha.copy() if need_clean else None
     if choke > 0:
         dist_map = cv2.distanceTransform(
             (alpha > 0).astype(np.uint8), cv2.DIST_L2, 3)
@@ -242,12 +206,10 @@ def matte_bgcolor_array(bgr: np.ndarray, colors: list, tol: float,
         k = feather * 2 + 1
         alpha = cv2.GaussianBlur(alpha, (k, k), 0)
 
-    # 5) 去溢色：中和边缘的绿边/蓝边
-    bgr = despill_edges(bgr, alpha, colors, despill_pct / 100.0)
-
-    # 6) 边缘净化：反解半透明像素的真实前景色，整体扣除混入的背景色
+    # 5) 边缘净化：用 key alpha 反解半透明像素的真实前景色，
+    #    整体扣除混入的背景色
     if need_clean:
-        bgr = decontaminate_edges(bgr, alpha, best_bg,
+        bgr = decontaminate_edges(bgr, key_alpha, best_bg,
                                   edge_clean_pct / 100.0)
 
     out = cv2.cvtColor(bgr, cv2.COLOR_BGR2BGRA)
@@ -324,7 +286,6 @@ class MattingWorker(QThread):
             tol=float(self.params["tolerance"]),
             feather=int(self.params["feather"]),
             choke=float(self.params.get("choke", 0)),
-            despill_pct=int(self.params.get("despill", 80)),
             protect_inner=bool(self.params.get("protect_inner", True)),
             edge_clean_pct=int(self.params.get("edge_clean", 0)),
         )
@@ -634,7 +595,7 @@ class FrameMattingPage(QWidget):
 
         # 模式参数（堆叠切换）
         self.params_stack = QStackedWidget()
-        self.params_stack.setMaximumHeight(294)
+        self.params_stack.setMaximumHeight(262)
 
         # 背景色抠图参数页
         bg_page = QWidget()
@@ -667,8 +628,8 @@ class FrameMattingPage(QWidget):
         tol_row.addWidget(QLabel("容差:"))
         self.tol_slider = QSlider(Qt.Horizontal)
         self.tol_slider.setRange(0, 150)
-        self.tol_slider.setValue(40)
-        self.tol_label = QLabel("40")
+        self.tol_slider.setValue(41)
+        self.tol_label = QLabel("41")
         self.tol_label.setMinimumWidth(30)
         self.tol_slider.valueChanged.connect(
             lambda v: self.tol_label.setText(str(v)))
@@ -680,8 +641,8 @@ class FrameMattingPage(QWidget):
         feather_row.addWidget(QLabel("羽化:"))
         self.feather_slider = QSlider(Qt.Horizontal)
         self.feather_slider.setRange(0, 10)
-        self.feather_slider.setValue(2)
-        self.feather_label = QLabel("2")
+        self.feather_slider.setValue(1)
+        self.feather_label = QLabel("1")
         self.feather_label.setMinimumWidth(30)
         self.feather_slider.valueChanged.connect(
             lambda v: self.feather_label.setText(str(v)))
@@ -693,8 +654,8 @@ class FrameMattingPage(QWidget):
         choke_row.addWidget(QLabel("边缘收缩:"))
         self.choke_slider = QSlider(Qt.Horizontal)
         self.choke_slider.setRange(0, 8)          # 步进 0.5px → 0~4.0px
-        self.choke_slider.setValue(0)
-        self.choke_label = QLabel("0.0")
+        self.choke_slider.setValue(1)
+        self.choke_label = QLabel("0.5")
         self.choke_label.setMinimumWidth(30)
         self.choke_slider.valueChanged.connect(
             lambda v: self.choke_label.setText(f"{v / 2.0:.1f}"))
@@ -702,25 +663,12 @@ class FrameMattingPage(QWidget):
         choke_row.addWidget(self.choke_label)
         bgl.addLayout(choke_row)
 
-        despill_row = QHBoxLayout()
-        despill_row.addWidget(QLabel("去溢色边:"))
-        self.despill_slider = QSlider(Qt.Horizontal)
-        self.despill_slider.setRange(0, 200)
-        self.despill_slider.setValue(80)
-        self.despill_label = QLabel("80%")
-        self.despill_label.setMinimumWidth(34)
-        self.despill_slider.valueChanged.connect(
-            lambda v: self.despill_label.setText(f"{v}%"))
-        despill_row.addWidget(self.despill_slider, 1)
-        despill_row.addWidget(self.despill_label)
-        bgl.addLayout(despill_row)
-
         clean_row = QHBoxLayout()
         clean_row.addWidget(QLabel("边缘净化:"))
         self.clean_slider = QSlider(Qt.Horizontal)
         self.clean_slider.setRange(0, 200)
-        self.clean_slider.setValue(100)
-        self.clean_label = QLabel("100%")
+        self.clean_slider.setValue(20)
+        self.clean_label = QLabel("20%")
         self.clean_label.setMinimumWidth(34)
         self.clean_slider.valueChanged.connect(
             lambda v: self.clean_label.setText(f"{v}%"))
@@ -730,7 +678,7 @@ class FrameMattingPage(QWidget):
 
         opt_row = QHBoxLayout()
         self.chk_protect_inner = QCheckBox("保护主体内部同色（防误删）")
-        self.chk_protect_inner.setChecked(False)
+        self.chk_protect_inner.setChecked(True)
         opt_row.addWidget(self.chk_protect_inner)
         opt_row.addStretch()
         bgl.addLayout(opt_row)
@@ -897,8 +845,7 @@ class FrameMattingPage(QWidget):
 
         # 参数变化 → 实时预览（80ms 防抖）
         for _s in (self.tol_slider, self.feather_slider,
-                   self.choke_slider, self.despill_slider,
-                   self.clean_slider):
+                   self.choke_slider, self.clean_slider):
             _s.valueChanged.connect(self._schedule_preview)
         self.chk_protect_inner.toggled.connect(self._schedule_preview)
 
@@ -1141,7 +1088,6 @@ class FrameMattingPage(QWidget):
                     tol=float(self.tol_slider.value()),
                     feather=int(self.feather_slider.value()),
                     choke=float(self.choke_slider.value()) / 2.0,
-                    despill_pct=int(self.despill_slider.value()),
                     protect_inner=bool(self.chk_protect_inner.isChecked()),
                     edge_clean_pct=int(self.clean_slider.value()),
                 )
@@ -1350,7 +1296,6 @@ class FrameMattingPage(QWidget):
             "tolerance": self.tol_slider.value(),
             "feather": self.feather_slider.value(),
             "choke": self.choke_slider.value() / 2.0,
-            "despill": self.despill_slider.value(),
             "edge_clean": self.clean_slider.value(),
             "protect_inner": self.chk_protect_inner.isChecked(),
         }
