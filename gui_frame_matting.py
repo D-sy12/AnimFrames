@@ -114,20 +114,31 @@ def border_connected_mask(seed: np.ndarray) -> np.ndarray:
 
 
 def despill_edges(bgr: np.ndarray, alpha: np.ndarray,
-                  colors: list, strength: float, slack: int = 6) -> np.ndarray:
+                  colors: list, strength: float, slack: int = 6,
+                  band: int = 2) -> np.ndarray:
     """
     去溢色（抑制背景色在前景边缘的色晕，如绿边/蓝边）。
     经典色键做法：背景色主导分量若高于另外两分量最大值+slack，把超出部分压回。
-    仅作用于半透明边缘像素；白/灰/纯前景像素 G≈R≈B，天然不受影响。
-    strength: 0.0~1.0
+    作用区：半透明像素 + 其外侧 band px 的不透明边缘（色边常落在不透明侧）。
+    白/灰像素 G≈R≈B，天然不受影响；远离边缘的像素不受影响。
+    strength: 0.0~2.0（100%=压平到参考线，>100%=压过头，用于顽固色边）
     """
     if strength <= 0:
         return bgr
     out = bgr.copy()
-    edge = (alpha > 0) & (alpha < 255)
-    if not edge.any():
+    semi = (alpha > 0) & (alpha < 255)
+    if not semi.any():
         return out
-    weight = (alpha.astype(np.float32) / 255.0) * strength
+    # 半透明边缘向外膨胀 band px，覆盖紧贴边缘的不透明溢色像素
+    zone = cv2.dilate(semi.astype(np.uint8),
+                      np.ones((band * 2 + 1, band * 2 + 1), np.uint8)).astype(bool)
+    zone &= alpha > 0
+    if not zone.any():
+        return out
+    # 半透明像素按透明度加权；不透明边缘像素满权（保证也能压下去）
+    w = np.where(alpha < 255,
+                 np.maximum(alpha.astype(np.float32) / 255.0, 0.25),
+                 1.0) * strength
     for r0, g0, b0 in colors:
         bg = np.array([b0, g0, r0], dtype=np.int16)   # BGR
         dominant = int(np.argmax(bg))
@@ -136,9 +147,61 @@ def despill_edges(bgr: np.ndarray, alpha: np.ndarray,
         ref = np.maximum(out[:, :, others[0]].astype(np.int16),
                          out[:, :, others[1]].astype(np.int16))
         over = np.clip(d - ref - slack, 0, 255).astype(np.float32)
-        new_d = np.clip(d - (over * weight).astype(np.int16), 0, 255)
+        new_d = np.clip(d - (over * w).astype(np.int16), 0, 255)
         out[:, :, dominant] = np.where(
-            edge, new_d.astype(np.uint8), out[:, :, dominant])
+            zone, new_d.astype(np.uint8), out[:, :, dominant])
+    return out
+
+
+def matte_bgcolor_array(bgr: np.ndarray, colors: list, tol: float,
+                        feather: int, choke: int, despill_pct: int,
+                        protect_inner: bool) -> np.ndarray:
+    """
+    色键抠像流水线（多背景色），输入 BGR 图像，返回 BGRA 结果。
+      1. 像素到最近背景色的 RGB 距离 + 软阈值
+      2. 连通域保护：只抠除与画面边缘连通的背景，保留主体内部同色
+      3. 边缘收缩(choke)：alpha 向内收 N px，吃掉主体边缘残留色边
+      4. 羽化：高斯柔化收缩后的硬边
+      5. 去溢色(despill)：中和边缘的背景色晕（可 >100% 加强压制）
+    worker 批量处理与界面实时预览共用此函数。
+    """
+    # 1) 每个像素到所有背景色的距离，取最小值
+    dist = None
+    for r, g, b in colors:
+        diff = bgr.astype(np.float32) - np.array([b, g, r], np.float32)
+        d = np.linalg.norm(diff, axis=2)
+        dist = d if dist is None else np.minimum(dist, d)
+
+    # 软阈值：0.75*tol 内全透明，tol 外全不透明，中间线性渐变
+    inner = tol * 0.75
+    soft = np.clip((dist - inner) / max(tol - inner, 1e-6), 0.0, 1.0)
+    alpha = (soft * 255).astype(np.uint8)
+
+    # 2) 连通域保护：只有与画面边缘连通的背景才允许被抠除
+    if protect_inner:
+        seed = (dist < inner).astype(np.uint8)
+        bg_core = border_connected_mask(seed)
+        if bg_core.max() > 0:
+            dilate_px = max(3, feather + choke + 1)
+            k = dilate_px * 2 + 1
+            bg_zone = cv2.dilate(bg_core, np.ones((k, k), np.uint8))
+            alpha = np.where(bg_zone > 0, alpha, 255).astype(np.uint8)
+
+    # 3) 边缘收缩：erode 让 alpha 边缘向内收，吃掉 1~N px 残留色边
+    if choke > 0:
+        k = choke * 2 + 1
+        alpha = cv2.erode(alpha, np.ones((k, k), np.uint8))
+
+    # 4) 羽化：柔化收缩后的边缘
+    if feather > 0:
+        k = feather * 2 + 1
+        alpha = cv2.GaussianBlur(alpha, (k, k), 0)
+
+    # 5) 去溢色：中和边缘的绿边/蓝边
+    bgr = despill_edges(bgr, alpha, colors, despill_pct / 100.0)
+
+    out = cv2.cvtColor(bgr, cv2.COLOR_BGR2BGRA)
+    out[:, :, 3] = alpha
     return out
 
 
@@ -194,22 +257,10 @@ class MattingWorker(QThread):
         self.all_done.emit(ok, fail)
 
     def _matte_bgcolor(self, src: str, dst: str):
-        """
-        色键抠像流水线（多背景色）：
-          1. 像素到最近背景色的 RGB 距离 + 软阈值
-          2. 连通域保护：只抠除与画面边缘连通的背景，保留主体内部同色
-          3. 边缘收缩(choke)：alpha 向内收 N px，吃掉主体边缘残留色边
-          4. 羽化：高斯柔化收缩后的硬边
-          5. 去溢色(despill)：中和半透明边缘的背景色晕
-        """
+        """色键抠像（实现见模块级 matte_bgcolor_array，本方法负责读写文件）"""
         colors = self.params.get("colors")
         if colors is None:  # 兼容旧版单色参数
             colors = [self.params["color"]]
-        tol = float(self.params["tolerance"])          # 0-150
-        feather = int(self.params["feather"])          # 0-10 px
-        choke = int(self.params.get("choke", 1))       # 0-4 px 边缘收缩
-        despill_pct = int(self.params.get("despill", 80))   # 0-100% 去溢色
-        protect_inner = bool(self.params.get("protect_inner", True))
 
         img = imread_unicode(src)
         if img is None:
@@ -218,46 +269,15 @@ class MattingWorker(QThread):
             img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
         bgr = img[:, :, :3]
 
-        # 1) 每个像素到所有背景色的距离，取最小值（命中任一颜色即视为背景）
-        dist = None
-        for r, g, b in colors:
-            diff = bgr.astype(np.float32) - np.array([b, g, r], np.float32)
-            d = np.linalg.norm(diff, axis=2)
-            dist = d if dist is None else np.minimum(dist, d)
+        out = matte_bgcolor_array(
+            bgr, colors,
+            tol=float(self.params["tolerance"]),
+            feather=int(self.params["feather"]),
+            choke=int(self.params.get("choke", 1)),
+            despill_pct=int(self.params.get("despill", 80)),
+            protect_inner=bool(self.params.get("protect_inner", True)),
+        )
 
-        # 软阈值：0.75*tol 内全透明，tol 外全不透明，中间线性渐变
-        inner = tol * 0.75
-        soft = np.clip((dist - inner) / max(tol - inner, 1e-6), 0.0, 1.0)
-        alpha = (soft * 255).astype(np.uint8)
-
-        # 2) 连通域保护：只有与画面边缘连通的背景才允许被抠除
-        if protect_inner:
-            seed = (dist < inner).astype(np.uint8)
-            bg_core = border_connected_mask(seed)
-            if bg_core.max() > 0:
-                # 膨胀覆盖主体轮廓外的颜色过渡带（受容差/羽化影响，通常 2~4px）
-                dilate_px = max(3, feather + choke + 1)
-                k = dilate_px * 2 + 1
-                bg_zone = cv2.dilate(bg_core, np.ones((k, k), np.uint8))
-                # 区域外强制不透明 → 主体内部同色被保留，容差可放心加大
-                alpha = np.where(bg_zone > 0, alpha, 255).astype(np.uint8)
-            # 没有任何连通背景种子时（容差过小），保持软阈值结果兜底
-
-        # 3) 边缘收缩：min 滤波让 alpha 边缘向内收，吃掉 1~N px 残留色边
-        if choke > 0:
-            k = choke * 2 + 1
-            alpha = cv2.erode(alpha, np.ones((k, k), np.uint8))
-
-        # 4) 羽化：柔化收缩后的边缘
-        if feather > 0:
-            k = feather * 2 + 1
-            alpha = cv2.GaussianBlur(alpha, (k, k), 0)
-
-        # 5) 去溢色：中和半透明边缘的绿边/蓝边
-        bgr = despill_edges(bgr, alpha, colors, despill_pct / 100.0)
-
-        out = cv2.cvtColor(bgr, cv2.COLOR_BGR2BGRA)
-        out[:, :, 3] = alpha
         os.makedirs(os.path.dirname(dst), exist_ok=True)
         if not imwrite_unicode(dst, out):
             raise IOError(f"写入失败 {dst}")
@@ -398,6 +418,12 @@ class FrameMattingPage(QWidget):
         self._resize_timer.setSingleShot(True)
         self._resize_timer.setInterval(150)
         self._resize_timer.timeout.connect(self._build_grid)
+
+        # 参数实时预览防抖（滑块拖动停止后再算，避免卡顿）
+        self._preview_timer = QTimer(self)
+        self._preview_timer.setSingleShot(True)
+        self._preview_timer.setInterval(80)
+        self._preview_timer.timeout.connect(self._live_preview)
 
         self._build_ui()
 
@@ -607,7 +633,7 @@ class FrameMattingPage(QWidget):
         despill_row = QHBoxLayout()
         despill_row.addWidget(QLabel("去溢色边:"))
         self.despill_slider = QSlider(Qt.Horizontal)
-        self.despill_slider.setRange(0, 100)
+        self.despill_slider.setRange(0, 200)
         self.despill_slider.setValue(80)
         self.despill_label = QLabel("80%")
         self.despill_label.setMinimumWidth(34)
@@ -619,7 +645,7 @@ class FrameMattingPage(QWidget):
 
         opt_row = QHBoxLayout()
         self.chk_protect_inner = QCheckBox("保护主体内部同色（防误删）")
-        self.chk_protect_inner.setChecked(True)
+        self.chk_protect_inner.setChecked(False)
         opt_row.addWidget(self.chk_protect_inner)
         opt_row.addStretch()
         bgl.addLayout(opt_row)
@@ -725,6 +751,12 @@ class FrameMattingPage(QWidget):
 
         # 初始背景色色块
         self._rebuild_color_chips()
+
+        # 参数变化 → 实时预览（80ms 防抖）
+        for _s in (self.tol_slider, self.feather_slider,
+                   self.choke_slider, self.despill_slider):
+            _s.valueChanged.connect(self._schedule_preview)
+        self.chk_protect_inner.toggled.connect(self._schedule_preview)
 
     # ---------- 加载 ----------
 
@@ -836,6 +868,13 @@ class FrameMattingPage(QWidget):
         # 加载原图（取色用）
         self.cur_image = QImage(item.filepath)
 
+        # 背景色模式 + 结果视图：用当前参数实时抠图预览（不落盘）
+        live = (self.rb_view_result.isChecked()
+                and self.rb_mode_bg.isChecked())
+        if live:
+            self._schedule_preview()
+            return
+
         show_result = (self.rb_view_result.isChecked()
                        and self.cur_index in self.results)
         src = self.results.get(self.cur_index) if show_result else item.filepath
@@ -847,6 +886,43 @@ class FrameMattingPage(QWidget):
         if show_result:
             scaled = compose_checkerboard(scaled)
         self.preview_label.setPixmap(scaled)
+
+    # ---------- 参数实时预览 ----------
+
+    def _schedule_preview(self):
+        """参数/颜色/帧变化后请求一次实时预览（80ms 防抖）"""
+        self._preview_timer.start()
+
+    def _live_preview(self):
+        """背景色模式：用界面上的当前参数实时抠当前帧，显示到工作区"""
+        if self.worker is not None and self.worker.isRunning():
+            return
+        if not self.rb_mode_bg.isChecked() or not self.rb_view_result.isChecked():
+            return
+        if not (0 <= self.cur_index < len(self.frames)) or not self._bg_colors:
+            return
+        item = self.frames[self.cur_index]
+        img = imread_unicode(item.filepath)
+        if img is None:
+            return
+        if img.ndim == 2:
+            img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+        bgra = matte_bgcolor_array(
+            img[:, :, :3], list(self._bg_colors),
+            tol=float(self.tol_slider.value()),
+            feather=int(self.feather_slider.value()),
+            choke=int(self.choke_slider.value()),
+            despill_pct=int(self.despill_slider.value()),
+            protect_inner=bool(self.chk_protect_inner.isChecked()),
+        )
+        rgba = cv2.cvtColor(bgra, cv2.COLOR_BGRA2RGBA)
+        h, w = rgba.shape[:2]
+        qimg = QImage(rgba.data, w, h, w * 4,
+                      QImage.Format_RGBA8888).copy()
+        pix = QPixmap.fromImage(qimg).scaled(
+            self.preview_label.size(), Qt.KeepAspectRatio,
+            Qt.SmoothTransformation)
+        self.preview_label.setPixmap(compose_checkerboard(pix))
 
     # ---------- 取色 ----------
 
@@ -923,6 +999,9 @@ class FrameMattingPage(QWidget):
             self.color_grid.addWidget(
                 chip, i // self.COLORS_PER_ROW, i % self.COLORS_PER_ROW)
 
+        # 颜色列表变化后刷新实时预览（初始化时无帧，预览槽会自行跳过）
+        self._schedule_preview()
+
     def _add_color(self, rgb: Tuple[int, int, int]) -> bool:
         """添加背景色，重复颜色不重复添加；返回是否为新增"""
         if rgb in self._bg_colors:
@@ -972,6 +1051,8 @@ class FrameMattingPage(QWidget):
             self.params_stack.setCurrentIndex(0)
         else:
             self.params_stack.setCurrentIndex(1)
+        # 切换模式后刷新工作区（背景色→实时预览，rembg→磁盘结果/原图）
+        self._show_current()
 
     # ---------- 执行 ----------
 
