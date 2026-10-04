@@ -458,7 +458,7 @@ class FrameColorPage(QWidget):
         self.method_group = QButtonGroup(self)
         self.rb_reinhard = QRadioButton("Reinhard 迁移")
         self.rb_hist = QRadioButton("直方图匹配")
-        self.rb_reinhard.setChecked(True)
+        self.rb_hist.setChecked(True)
         self.rb_reinhard.setToolTip("Lab 空间对齐均值/标准差，色调自然")
         self.rb_hist.setToolTip("逐通道匹配直方图分布，对齐更强")
         for rb in (self.rb_reinhard, self.rb_hist):
@@ -620,10 +620,11 @@ class FrameColorPage(QWidget):
         else:
             self.board_mode = "frame"
             self.board_custom_path = ""
-        if saved.get("method") == "hist":
-            self.rb_hist.setChecked(True)
-        else:
+        # 缺省（旧记录或首次进入）使用直方图匹配
+        if saved.get("method") == "reinhard":
             self.rb_reinhard.setChecked(True)
+        else:
+            self.rb_hist.setChecked(True)
         st = int(saved.get("strength", 100))
         self.strength_slider.setValue(max(0, min(100, st)))
 
