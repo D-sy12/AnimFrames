@@ -10,6 +10,7 @@
   5. 色调统一
   6. 调整位置
   7. 导出图片
+  8. 动画预览（独立工具，不参与会话存档）
 
 运行：
     python main_app.py11
@@ -54,6 +55,7 @@ from gui_frame_refine import FrameRefinePage
 from gui_frame_color import FrameColorPage
 from gui_frame_adjust import FrameAdjustPage
 from gui_frame_export import FrameExportPage
+from gui_anim_preview import AnimPreviewPage
 
 
 # ===================== 主窗口 =====================
@@ -67,6 +69,7 @@ class MainApp(QMainWindow):
         ("color",     "色调统一"),
         ("adjust",    "调整位置"),
         ("export",    "导出图片"),
+        ("anim",      "动画预览"),
     ]
 
     def __init__(self):
@@ -173,6 +176,10 @@ class MainApp(QMainWindow):
         # 页面 7：导出图片
         self.page_export = FrameExportPage(self.shared_state)
         self.stack.addWidget(self.page_export)
+
+        # 页面 8：动画预览（独立工具，不参与会话存档）
+        self.page_anim = AnimPreviewPage(self.shared_state)
+        self.stack.addWidget(self.page_anim)
 
     def _switch_page(self, idx: int):
         self.stack.setCurrentIndex(idx)
