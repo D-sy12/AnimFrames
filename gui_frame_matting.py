@@ -150,6 +150,43 @@ def decontaminate_edges(bgr: np.ndarray, alpha: np.ndarray,
     return np.clip(out, 0.0, 255.0).astype(np.uint8)
 
 
+def inpaint_background(bgr: np.ndarray, alpha: np.ndarray) -> np.ndarray:
+    """
+    估计每个像素处的背景色（rembg 模式下背景色未知）：
+    全透明区域（alpha==0）的原图颜色就是真实背景，用修补算法
+    把它向主体/边缘区域传播。反解只作用于边缘带（主体内部 a≈1
+    时 F=(C-(1-a)B)/a≈C，估计误差无影响）。
+    全图几乎没有透明区域时退化为画面四边像素的中位色。
+    """
+    pure_bg = alpha == 0
+    if int(pure_bg.sum()) < max(64, alpha.size // 1000):
+        border = np.concatenate([
+            bgr[0, :].reshape(-1, 3), bgr[-1, :].reshape(-1, 3),
+            bgr[:, 0].reshape(-1, 3), bgr[:, -1].reshape(-1, 3)])
+        med = np.median(border.astype(np.float32), axis=0)
+        return np.broadcast_to(med, bgr.shape).astype(np.float32).copy()
+    mask = (~pure_bg).astype(np.uint8) * 255
+    bg = cv2.inpaint(bgr, mask, 3, cv2.INPAINT_TELEA)
+    return bg.astype(np.float32)
+
+
+def decontaminate_rembg(bgr: np.ndarray, bgra: np.ndarray,
+                        edge_clean_pct: int) -> np.ndarray:
+    """
+    rembg 结果的边缘净化：背景色未知，先从全透明区域修补估计背景色，
+    再按 alpha 合成公式反解半透明边缘像素的真实前景色（深色/杂色
+    背景在 rembg 软边上留下的灰边色渍可由此扣除）。
+    """
+    if edge_clean_pct <= 0:
+        return bgra
+    alpha = bgra[:, :, 3]
+    bg = inpaint_background(bgr, alpha)
+    out = bgra.copy()
+    out[:, :, :3] = decontaminate_edges(
+        bgr, alpha, bg, edge_clean_pct / 100.0)
+    return out
+
+
 def matte_bgcolor_array(bgr: np.ndarray, colors: list, tol: float,
                         feather: int, choke: float,
                         protect_inner: bool,
@@ -299,13 +336,26 @@ class MattingWorker(QThread):
             raise IOError(f"写入失败 {dst}")
 
     def _matte_rembg(self, src: str, dst: str, session):
-        """rembg 主体抠图"""
+        """rembg 主体抠图（可选边缘净化：修补估计背景色后反解边缘色渍）"""
         from PIL import Image
         from rembg import remove
+        clean = int(self.params.get("edge_clean", 0))
         pil = Image.open(src).convert("RGBA")
         out = remove(pil, session=session)
         os.makedirs(os.path.dirname(dst), exist_ok=True)
-        out.save(dst)
+        if clean > 0:
+            bgr = imread_unicode(src)
+            if bgr is None:
+                raise IOError(f"无法读取 {src}")
+            if bgr.ndim == 2:
+                bgr = cv2.cvtColor(bgr, cv2.COLOR_GRAY2BGR)
+            bgr = bgr[:, :, :3]
+            bgra = cv2.cvtColor(np.array(out), cv2.COLOR_RGBA2BGRA)
+            out_arr = decontaminate_rembg(bgr, bgra, clean)
+            if not imwrite_unicode(dst, out_arr):
+                raise IOError(f"写入失败 {dst}")
+        else:
+            out.save(dst)
 
 
 # ===================== 预览区（支持取色） =====================
@@ -700,7 +750,22 @@ class FrameMattingPage(QWidget):
             self.model_combo.addItem(label, val)
         model_row.addWidget(self.model_combo, 1)
         rl2.addLayout(model_row)
-        tip = QLabel("首次使用会自动下载模型文件（约 170MB），请耐心等待")
+
+        clean_r_row = QHBoxLayout()
+        clean_r_row.addWidget(QLabel("边缘净化:"))
+        self.rembg_clean_slider = QSlider(Qt.Horizontal)
+        self.rembg_clean_slider.setRange(0, 200)
+        self.rembg_clean_slider.setValue(50)
+        self.rembg_clean_label = QLabel("50%")
+        self.rembg_clean_label.setMinimumWidth(34)
+        self.rembg_clean_slider.valueChanged.connect(
+            lambda v: self.rembg_clean_label.setText(f"{v}%"))
+        clean_r_row.addWidget(self.rembg_clean_slider, 1)
+        clean_r_row.addWidget(self.rembg_clean_label)
+        rl2.addLayout(clean_r_row)
+
+        tip = QLabel("首次使用会自动下载模型文件（约 170MB），请耐心等待\n"
+                     "边缘净化：估计背景色并扣除边缘半透明像素里混入的背景杂色")
         tip.setStyleSheet("color:#666; font-size:11px;")
         tip.setWordWrap(True)
         rl2.addWidget(tip)
@@ -1282,6 +1347,13 @@ class FrameMattingPage(QWidget):
             "protect_inner": self.chk_protect_inner.isChecked(),
         }
 
+    def _collect_rembg_params(self) -> dict:
+        """统一收集 rembg 抠图参数（同时用于 worker 与 matted_info.json）"""
+        return {
+            "model": self.model_combo.currentData(),
+            "edge_clean": self.rembg_clean_slider.value(),
+        }
+
     def _start_worker(self, targets: List[int]):
         if self.worker is not None and self.worker.isRunning():
             return
@@ -1304,7 +1376,7 @@ class FrameMattingPage(QWidget):
             params = self._collect_bg_params()
         else:
             mode = "rembg"
-            params = {"model": self.model_combo.currentData()}
+            params = self._collect_rembg_params()
 
         self.worker = MattingWorker(mode, tasks, params, self)
         self.worker.progress.connect(self._on_progress)
@@ -1356,7 +1428,7 @@ class FrameMattingPage(QWidget):
                 params = self._collect_bg_params()
             else:
                 mode = "rembg"
-                params = {"model": self.model_combo.currentData()}
+                params = self._collect_rembg_params()
 
             frames = []
             for idx in sorted(self.selected & set(self.results)):
