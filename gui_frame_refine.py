@@ -536,29 +536,23 @@ class FrameRefinePage(QWidget):
         rlay.setContentsMargins(0, 0, 0, 0)
         rlay.setSpacing(8)
 
-        # --- 图片导航（从左侧工作区移入） ---
-        nav_box = QGroupBox("图片导航")
-        nv = QVBoxLayout(nav_box)
-        nv.setSpacing(4)
+        # --- 图片导航（紧凑一行，无组框） ---
         nav_row = QHBoxLayout()
+        nav_row.setSpacing(6)
         btn_prev = QPushButton("⏮ 上一张")
         btn_next = QPushButton("下一张 ⏭")
         btn_prev.clicked.connect(self._prev_image)
         btn_next.clicked.connect(self._next_image)
         nav_row.addWidget(btn_prev)
         nav_row.addWidget(btn_next)
-        nav_row.addStretch()
-        nv.addLayout(nav_row)
-        pos_row = QHBoxLayout()
         self.pos_label = QLabel("- / -")
         self.pos_label.setStyleSheet("color:#888;")
-        pos_row.addWidget(self.pos_label)
-        pos_row.addStretch()
+        nav_row.addWidget(self.pos_label)
+        nav_row.addStretch()
         self.state_label = QLabel("")
         self.state_label.setStyleSheet("color:#2ecc71;")
-        pos_row.addWidget(self.state_label)
-        nv.addLayout(pos_row)
-        rlay.addWidget(nav_box, 0)
+        nav_row.addWidget(self.state_label)
+        rlay.addLayout(nav_row)
 
         # --- 数据源/输出 ---
         dir_box = QGroupBox("图片来源")
@@ -582,8 +576,8 @@ class FrameRefinePage(QWidget):
         dl.addLayout(btn_row)
         rlay.addWidget(dir_box, 0)
 
-        # --- 工具 ---
-        tool_box = QGroupBox("工具")
+        # --- 工具与笔刷（合并为一组） ---
+        tool_box = QGroupBox("工具与笔刷")
         tl = QVBoxLayout(tool_box)
         tl.setSpacing(4)
         tool_row = QHBoxLayout()
@@ -600,17 +594,10 @@ class FrameRefinePage(QWidget):
         self.rb_restore.toggled.connect(self._on_tool_changed)
         tl.addLayout(tool_row)
         tool_tip = QLabel(
-            "橡皮擦：擦掉不要的部分\n"
-            "背景橡皮擦：只擦与落笔处颜色相近的像素，保护主体\n"
+            "橡皮擦：擦掉不要的部分；背景橡皮擦：只擦与落笔处颜色相近的像素；\n"
             "还原橡皮擦：从原始帧补回被误擦的部分")
         tool_tip.setStyleSheet("color:#888;font-size:11px;")
         tl.addWidget(tool_tip)
-        rlay.addWidget(tool_box, 0)
-
-        # --- 笔刷参数 ---
-        brush_box = QGroupBox("笔刷")
-        bl = QVBoxLayout(brush_box)
-        bl.setSpacing(4)
 
         size_row = QHBoxLayout()
         size_row.addWidget(QLabel("大小:"))
@@ -623,10 +610,10 @@ class FrameRefinePage(QWidget):
             lambda v: self.size_label.setText(str(v)))
         size_row.addWidget(self.size_slider, 1)
         size_row.addWidget(self.size_label)
-        bl.addLayout(size_row)
+        tl.addLayout(size_row)
 
         tol_row = QHBoxLayout()
-        tol_row.addWidget(QLabel("背景橡皮容差:"))
+        tol_row.addWidget(QLabel("容差:"))
         self.tol_slider = QSlider(Qt.Horizontal)
         self.tol_slider.setRange(5, 150)
         self.tol_slider.setValue(40)
@@ -636,8 +623,8 @@ class FrameRefinePage(QWidget):
             lambda v: self.tol_label.setText(str(v)))
         tol_row.addWidget(self.tol_slider, 1)
         tol_row.addWidget(self.tol_label)
-        bl.addLayout(tol_row)
-        rlay.addWidget(brush_box, 0)
+        tl.addLayout(tol_row)
+        rlay.addWidget(tool_box, 0)
 
         # --- 操作 ---
         op_box = QGroupBox("操作（每张图独立撤销）")

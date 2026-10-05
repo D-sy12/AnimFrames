@@ -35,11 +35,13 @@ from PySide6.QtWidgets import (
     QPushButton, QScrollArea, QGroupBox, QCheckBox, QSpinBox,
     QToolButton, QFrame, QMessageBox, QFileDialog, QDialog,
     QDialogButtonBox, QComboBox, QDoubleSpinBox, QButtonGroup,
-    QRadioButton,
+    QRadioButton, QSlider,
 )
 
 import export_utils as eu
-from gui_frame_matting import imwrite_unicode, compose_checkerboard
+from gui_frame_matting import (
+    imread_unicode, imwrite_unicode, compose_checkerboard,
+)
 from gui_frame_color import FitImageLabel, bgra_to_pixmap
 
 
@@ -818,6 +820,11 @@ class FrameExportPage(QWidget):
         self._resize_timer.setInterval(150)
         self._resize_timer.timeout.connect(self._on_view_resized)
 
+        # 帧播放（检查抖动）：_play_key=None 表示正常显示全部图层
+        self._play_key: Optional[str] = None
+        self._play_timer = QTimer(self)
+        self._play_timer.timeout.connect(self._play_tick)
+
         self._build_ui()
         QShortcut(QKeySequence("Ctrl+Z"), self, self._undo_selected)
 
@@ -839,6 +846,103 @@ class FrameExportPage(QWidget):
         self.view.marquee_done.connect(self._on_marquee_done)
         self.view.marquee_changed.connect(self._on_marquee_changed)
         lv.addWidget(self.view, 1)
+
+        # ===== 帧播放（检查播放时各帧位置是否抖动）=====
+        play_box = QGroupBox("帧播放（逐帧播放，检查主体位置是否抖动）")
+        pl = QVBoxLayout(play_box)
+        pl.setContentsMargins(8, 4, 8, 6)
+        pl.setSpacing(4)
+        pr1 = QHBoxLayout()
+        pr1.setSpacing(4)
+        self.btn_play_first = QToolButton()
+        self.btn_play_first.setText("⏮")
+        self.btn_play_first.setToolTip("第一帧")
+        self.btn_play_prev = QToolButton()
+        self.btn_play_prev.setText("◀")
+        self.btn_play_prev.setToolTip("上一帧（暂停）")
+        self.btn_play = QPushButton("▶ 播放")
+        self.btn_play.setFixedWidth(88)
+        self.btn_play_next = QToolButton()
+        self.btn_play_next.setText("▶")
+        self.btn_play_next.setToolTip("下一帧（暂停）")
+        self.btn_play_stop = QToolButton()
+        self.btn_play_stop.setText("⏹")
+        self.btn_play_stop.setToolTip("停止并恢复显示全部图层")
+        for b in (self.btn_play_first, self.btn_play_prev,
+                  self.btn_play_next, self.btn_play_stop):
+            b.setFixedSize(30, 26)
+            pr1.addWidget(b)
+        pr1.addWidget(self.btn_play)
+        self.scr_play = QSlider(Qt.Horizontal)
+        self.scr_play.setRange(0, 0)
+        self.scr_play.setToolTip("拖动查看指定帧（自动暂停）")
+        pr1.addWidget(self.scr_play, 1)
+        self.lbl_play_pos = QLabel("0/0")
+        self.lbl_play_pos.setFixedWidth(48)
+        self.lbl_play_pos.setAlignment(Qt.AlignCenter)
+        self.lbl_play_pos.setStyleSheet("color:#888;")
+        pr1.addWidget(self.lbl_play_pos)
+        self.cmb_fps = QComboBox()
+        self.cmb_fps.addItems(["4 fps", "6 fps", "8 fps", "12 fps",
+                               "15 fps", "24 fps"])
+        self.cmb_fps.setCurrentText("12 fps")
+        self.cmb_fps.setToolTip("播放帧率（帧/秒）")
+        pr1.addWidget(QLabel("速度"))
+        pr1.addWidget(self.cmb_fps)
+        pl.addLayout(pr1)
+
+        pr2 = QHBoxLayout()
+        pr2.setSpacing(6)
+        self.chk_loop = QCheckBox("循环")
+        self.chk_loop.setChecked(True)
+        self.btn_jitter = QPushButton("📊 抖动扫描")
+        self.btn_jitter.setToolTip(
+            "计算所有相邻帧主体中心的位移，列出抖动最大的帧")
+        pr2.addWidget(self.chk_loop)
+        pr2.addWidget(self.btn_jitter)
+        pr2.addSpacing(10)
+        pr2.addWidget(QLabel("自动对齐："))
+        self.cmb_align = QComboBox()
+        self.cmb_align.addItems(["中间对齐", "底部对齐"])
+        self.cmb_align.setToolTip(
+            "中间对齐：每帧主体包围盒中心对齐到画布中心\n"
+            "底部对齐：每帧主体底边对齐到距画布底边指定像素处")
+        pr2.addWidget(self.cmb_align)
+        self.spn_bottom = QSpinBox()
+        self.spn_bottom.setRange(0, 100000)
+        self.spn_bottom.setValue(20)
+        self.spn_bottom.setSuffix(" px")
+        self.spn_bottom.setFixedWidth(80)
+        self.spn_bottom.setEnabled(False)   # 默认中间对齐，底边参数不可用
+        self.spn_bottom.setToolTip("主体底边距画布底边的像素数")
+        pr2.addWidget(self.spn_bottom)
+        self.chk_align_cx = QCheckBox("水平居中")
+        self.chk_align_cx.setChecked(True)
+        self.chk_align_cx.setEnabled(False)
+        self.chk_align_cx.setToolTip("底部对齐时，是否同时把每帧主体水平居中")
+        pr2.addWidget(self.chk_align_cx)
+        self.btn_align = QPushButton("一键对齐")
+        self.btn_align.setToolTip(
+            "按所选方式移动所有可见帧的主体（各帧可单独撤销）")
+        pr2.addWidget(self.btn_align)
+        pr2.addStretch()
+        self.lbl_jitter = QLabel("")
+        self.lbl_jitter.setStyleSheet("color:#2ecc71;font-size:12px;")
+        pr2.addWidget(self.lbl_jitter)
+        pl.addLayout(pr2)
+
+        self.btn_play_first.clicked.connect(self._play_first)
+        self.btn_play_prev.clicked.connect(lambda: self._play_step(-1))
+        self.btn_play.clicked.connect(self._play_toggle)
+        self.btn_play_next.clicked.connect(lambda: self._play_step(1))
+        self.btn_play_stop.clicked.connect(self._play_stop)
+        self.scr_play.valueChanged.connect(self._on_play_scrub)
+        self.cmb_fps.currentTextChanged.connect(self._on_fps_changed)
+        self.cmb_align.currentIndexChanged.connect(self._on_align_mode_changed)
+        self.btn_align.clicked.connect(self._auto_align)
+        self.btn_jitter.clicked.connect(self._jitter_scan)
+        lv.addWidget(play_box, 0)
+
         self.info_label = QLabel("尚未加载图片")
         self.info_label.setStyleSheet("color:#f1c40f;font-size:12px;")
         lv.addWidget(self.info_label)
@@ -997,6 +1101,8 @@ class FrameExportPage(QWidget):
         self.chk_sprite_preview.toggled.connect(
             lambda *_: self.view.zoom_reset())
         self.chk_sprite_preview.toggled.connect(self._render_preview)
+        self.chk_sprite_preview.toggled.connect(
+            self._on_sprite_preview_toggled)
         row3.addWidget(self.chk_sprite_preview)
         sf.addLayout(row3)
 
@@ -1154,6 +1260,10 @@ class FrameExportPage(QWidget):
         self._undo_coalesce = {}
         self._drag_pending = None
         self._ws_cache = None
+        self._play_timer.stop()
+        self._play_key = None
+        self.btn_play.setText("▶ 播放")
+        self.lbl_jitter.setText("")
         self.selected_keys = set()
         self._canvas_anchor = (1, 1)       # 画布扩展定位 (row,col) 0..2
         self._canvas_ext_color = "透明"
@@ -1170,6 +1280,7 @@ class FrameExportPage(QWidget):
         self._rebuild_layer_list()
         self._start_preview_loader()
         self._update_size_info()
+        self._update_playbar()
         self.status_text(
             f"已加载 {len(self.items)} 张（来源：{self._stage_name()}）")
 
@@ -1258,8 +1369,11 @@ class FrameExportPage(QWidget):
         self._undo_coalesce = {}
         self._drag_pending = None
         self._ws_cache = None
+        self._play_timer.stop()
+        self._play_key = None
         self.selected_keys = set()
         self._update_undo_ui()
+        self._update_playbar()
         self.view.set_image(None)
         self.info_label.setText(text)
         self.size_label.setText("输出尺寸：-")
@@ -1522,11 +1636,19 @@ class FrameExportPage(QWidget):
         new_w, new_h, anchor, color = dlg.result_values()
         self._canvas_anchor = anchor
         self._canvas_ext_color = color
-        # 切为手动并写入新宽高
+        # 切为手动并写入新宽高（抑制中途信号，统一在末尾刷新一次）
+        self.chk_canvas_auto.blockSignals(True)
+        self.spn_cw.blockSignals(True)
+        self.spn_ch.blockSignals(True)
         self.chk_canvas_auto.setChecked(False)
         self.spn_cw.setValue(new_w)
         self.spn_ch.setValue(new_h)
+        self.chk_canvas_auto.blockSignals(False)
+        self.spn_cw.blockSignals(False)
+        self.spn_ch.blockSignals(False)
         self._apply_canvas_anchor(cw, ch, new_w, new_h, anchor)
+        # 显式同步画布尺寸/输出尺寸标签（setValue 信号已被抑制）
+        self._update_size_info()
         self.status_text(
             f"画布大小 {cw}×{ch} → {new_w}×{new_h}"
             f"（锚点 {['左上','上','右上','左','中','右','左下','下','右下'][anchor[0]*3+anchor[1]]}，"
@@ -1546,9 +1668,11 @@ class FrameExportPage(QWidget):
         off_y = dy * (ar - 1) / 2.0
         if off_x == 0 and off_y == 0:
             return
-        for key in list(self._layer_offsets.keys()):
+        # 所有图层（含从未移动过、不在 _layer_offsets 里的）都要跟随锚点
+        for it in self.items:
+            key = it["key"]
             self._push_undo(key)
-            ox, oy = self._layer_offsets[key]
+            ox, oy = self._layer_offsets.get(key, (0.0, 0.0))
             self._layer_offsets[key] = [ox + off_x, oy + off_y]
         self._ws_cache = None
         self._schedule_preview()
@@ -1590,6 +1714,7 @@ class FrameExportPage(QWidget):
                 self._layer_offsets[key] = [ox * scale, oy * scale]
         self._ws_cache = None
         self._sync_row_scales()
+        self._update_size_info()
         self._render_preview()
         self._save_timer.start()
         self.status_text(
@@ -1632,6 +1757,333 @@ class FrameExportPage(QWidget):
     def _visible_items(self) -> List[dict]:
         return [it for it in self.items
                 if self._layer_visible.get(it["key"], True)]
+
+    # ---------- 帧播放（检查抖动） ----------
+
+    def _play_visible_keys(self) -> List[str]:
+        return [it["key"] for it in self._visible_items()]
+
+    def _play_fps(self) -> int:
+        try:
+            return max(1, int(self.cmb_fps.currentText().split()[0]))
+        except (ValueError, IndexError):
+            return 12
+
+    def _update_playbar(self):
+        """根据当前可见帧列表同步滑块范围/标签；播放帧失效时修正"""
+        keys = self._play_visible_keys()
+        n = len(keys)
+        on = n > 0
+        for w in (self.btn_play_first, self.btn_play_prev, self.btn_play,
+                  self.btn_play_next, self.btn_play_stop, self.scr_play,
+                  self.cmb_fps, self.btn_jitter, self.chk_loop,
+                  self.cmb_align, self.btn_align):
+            w.setEnabled(on)
+        self.spn_bottom.setEnabled(on and self.cmb_align.currentIndex() == 1)
+        self.chk_align_cx.setEnabled(
+            on and self.cmb_align.currentIndex() == 1)
+        need_render = False
+        if self._play_key is not None and self._play_key not in keys:
+            self._play_timer.stop()
+            self.btn_play.setText("▶ 播放")
+            self._play_key = keys[0] if n else None
+            need_render = n > 0
+        v = (keys.index(self._play_key) + 1) if self._play_key in keys else 1
+        self.scr_play.blockSignals(True)
+        self.scr_play.setRange(1, max(1, n))
+        self.scr_play.setValue(v)
+        self.scr_play.blockSignals(False)
+        self.lbl_play_pos.setText(f"{v if n else 0}/{n}")
+        if not n:
+            self.lbl_jitter.setText("")
+        if need_render:
+            self._ws_cache = None
+            self._schedule_preview()
+        elif self._play_key is not None:
+            self._update_jitter_label()
+
+    def _play_alpha_map(self) -> Optional[Dict[str, float]]:
+        """播放模式下只显示当前帧"""
+        if not self._play_key:
+            return None
+        keys = self._play_visible_keys()
+        if self._play_key not in keys:
+            return None
+        return {self._play_key: 1.0}
+
+    def _play_toggle(self):
+        if self._play_timer.isActive():
+            self._play_timer.stop()
+            self.btn_play.setText("▶ 播放")
+            self._ws_cache = None
+            self._render_preview()
+            return
+        keys = self._play_visible_keys()
+        if not keys:
+            self.status_text("没有可见帧可播放")
+            return
+        if self.chk_sprite_preview.isChecked():
+            self.chk_sprite_preview.setChecked(False)  # 切回工作台
+        if self._play_key not in keys:
+            self._play_key = keys[0]
+        self._play_timer.start(max(1, int(1000 / self._play_fps())))
+        self.btn_play.setText("⏸ 暂停")
+        self._ws_cache = None
+        self._render_preview()
+
+    def _play_tick(self):
+        """定时器：前进一帧，循环或停在末尾"""
+        keys = self._play_visible_keys()
+        if not keys:
+            self._play_stop()
+            return
+        i = keys.index(self._play_key) if self._play_key in keys else -1
+        j = i + 1
+        if j >= len(keys):
+            if self.chk_loop.isChecked():
+                j = 0
+            else:
+                self._play_timer.stop()
+                self.btn_play.setText("▶ 播放")
+                return
+        self._play_seek(keys[j])
+
+    def _play_step(self, delta: int):
+        """按钮：相对步进（自动暂停）"""
+        keys = self._play_visible_keys()
+        if not keys:
+            return
+        self._play_timer.stop()
+        self.btn_play.setText("▶ 播放")
+        if self.chk_sprite_preview.isChecked():
+            self.chk_sprite_preview.setChecked(False)
+        i = keys.index(self._play_key) if self._play_key in keys else (
+            0 if delta > 0 else len(keys) - 1)
+        j = min(max(0, i + delta), len(keys) - 1)
+        self._play_seek(keys[j])
+
+    def _play_first(self):
+        keys = self._play_visible_keys()
+        if not keys:
+            return
+        self._play_timer.stop()
+        self.btn_play.setText("▶ 播放")
+        if self.chk_sprite_preview.isChecked():
+            self.chk_sprite_preview.setChecked(False)
+        self._play_seek(keys[0])
+
+    def _play_seek(self, key: str):
+        self._play_key = key
+        keys = self._play_visible_keys()
+        v = keys.index(key) + 1 if key in keys else 1
+        self.scr_play.blockSignals(True)
+        self.scr_play.setValue(v)
+        self.scr_play.blockSignals(False)
+        self.lbl_play_pos.setText(f"{v}/{len(keys)}")
+        self._ws_cache = None
+        self._render_preview()
+        self._update_jitter_label()
+
+    def _play_stop(self):
+        self._play_timer.stop()
+        self.btn_play.setText("▶ 播放")
+        if self._play_key is None:
+            return
+        self._play_key = None
+        self.lbl_jitter.setText("")
+        self._ws_cache = None
+        self._render_preview()
+
+    def _on_play_scrub(self, v: int):
+        keys = self._play_visible_keys()
+        if not keys:
+            return
+        self._play_timer.stop()
+        self.btn_play.setText("▶ 播放")
+        if self.chk_sprite_preview.isChecked():
+            self.chk_sprite_preview.setChecked(False)
+        j = min(max(1, v), len(keys)) - 1
+        self._play_seek(keys[j])
+
+    def _on_fps_changed(self):
+        if self._play_timer.isActive():
+            self._play_timer.setInterval(max(1, int(1000 / self._play_fps())))
+
+    def _on_align_mode_changed(self, idx: int):
+        # 中间对齐恒为水平+垂直居中；底边参数与水平居中选项仅底部模式可用
+        bottom = idx == 1
+        self.spn_bottom.setEnabled(bottom and bool(self.items))
+        self.chk_align_cx.setEnabled(bottom and bool(self.items))
+
+    def _subject_bbox_full(self, key: str):
+        """从源文件直接读全分辨率主体 alpha 包围盒 (l,t,r,b)，右/下开区间"""
+        it = next((x for x in self.items if x["key"] == key), None)
+        if it is None:
+            return None
+        img = imread_unicode(it["src"])
+        if img is None or img.ndim < 3 or img.shape[2] < 4:
+            return None
+        ys, xs = np.nonzero(img[..., 3] > 16)
+        if xs.size == 0:
+            return None
+        return (int(xs.min()), int(ys.min()),
+                int(xs.max()) + 1, int(ys.max()) + 1)
+
+    def _auto_align(self):
+        """
+        自动对齐所有可见帧（每帧各入一个撤销点）：
+          中间对齐：主体包围盒中心 → 画布中心（X/Y）
+          底部对齐：主体底边 → 距画布底边 N px；可选同时水平居中
+        """
+        vis = self._visible_items()
+        if len(vis) < 1:
+            self.status_text("没有可见帧可对齐")
+            return
+        mode_bottom = self.cmb_align.currentIndex() == 1
+        margin = self.spn_bottom.value()
+        center_x = self.chk_align_cx.isChecked()
+        cw, ch = self._canvas_size()
+
+        moved = 0
+        skipped = []
+        max_shift = 0.0
+        for it in vis:
+            key = it["key"]
+            bbox = self._subject_bbox_full(key)
+            if bbox is None:
+                skipped.append(key)
+                continue
+            l, t, r, b = bbox
+            pct = float(self._layer_scales.get(key, 100)) / 100.0
+            w, h = float(it["w"]), float(it["h"])
+            cx = (l + r) / 2.0
+            by = float(b)
+            ox_new, oy_new = self._layer_offsets.get(key, (0.0, 0.0))
+            if mode_bottom:
+                # 画布中主体底边 = (ch-h*pct)/2 + oy + b*pct，目标 ch-margin
+                oy_new = ch - margin - (ch - h * pct) / 2.0 - by * pct
+                if center_x:
+                    ox_new = pct * (w / 2.0 - cx)
+            else:
+                # 画布中主体中心 = 画布中心
+                ox_new = pct * (w / 2.0 - cx)
+                oy_new = pct * (h / 2.0 - (t + b) / 2.0)
+            ox_old, oy_old = self._layer_offsets.get(key, (0.0, 0.0))
+            shift = float(np.hypot(ox_new - ox_old, oy_new - oy_old))
+            if shift > 0.01:
+                self._push_undo(key)
+                self._layer_offsets[key] = [ox_new, oy_new]
+                moved += 1
+                max_shift = max(max_shift, shift)
+        if not moved:
+            self.status_text("所有帧已在对齐位置，无需移动")
+            return
+        self._ws_cache = None
+        self._render_preview()
+        self._save_timer.start()
+        if self._play_key is not None:
+            self._update_jitter_label()
+        name = f"底部对齐（距底边 {margin}px" \
+               + ("，水平居中" if mode_bottom and center_x else "") + "）" \
+            if mode_bottom else "中间对齐"
+        msg = f"{name}：已移动 {moved}/{len(vis)} 帧，最大位移 {max_shift:.1f}px"
+        if skipped:
+            msg += f"，{len(skipped)} 帧无主体跳过"
+        self.status_text(msg)
+
+    def _on_sprite_preview_toggled(self, sprite_mode: bool):
+        # 切到精灵图预览时暂停帧播放（保留当前帧，切回来可继续）
+        if sprite_mode and self._play_timer.isActive():
+            self._play_timer.stop()
+            self.btn_play.setText("▶ 播放")
+
+    def _subject_center(self, key: str):
+        """主体 alpha 包围盒中心在当前画布坐标系中的位置（含缩放/偏移）"""
+        cached = self.preview_cache.get(key)
+        if cached is None:
+            return None
+        im, cf = cached
+        ys, xs = np.where(im[..., 3] > 16)
+        if xs.size == 0:
+            return None
+        bx = (int(xs.min()) + int(xs.max()) + 1) / 2.0 / cf
+        by = (int(ys.min()) + int(ys.max()) + 1) / 2.0 / cf
+        it = next((x for x in self.items if x["key"] == key), None)
+        if it is None:
+            return None
+        pct = float(self._layer_scales.get(key, 100)) / 100.0
+        cw, ch = self._canvas_size()
+        ox, oy = self._layer_offsets.get(key, (0.0, 0.0))
+        return (cw / 2.0 + ox + (bx - it["w"] / 2.0) * pct,
+                ch / 2.0 + oy + (by - it["h"] / 2.0) * pct)
+
+    def _frame_shift(self, idx: int, keys: List[str]):
+        """当前帧相对前一可见帧的主体中心位移 (dx, dy, dist)"""
+        if idx <= 0 or idx >= len(keys):
+            return None
+        c0 = self._subject_center(keys[idx - 1])
+        c1 = self._subject_center(keys[idx])
+        if c0 is None or c1 is None:
+            return None
+        dx, dy = c1[0] - c0[0], c1[1] - c0[1]
+        return dx, dy, float(np.hypot(dx, dy))
+
+    def _update_jitter_label(self):
+        keys = self._play_visible_keys()
+        if not self._play_key or self._play_key not in keys:
+            self.lbl_jitter.setText("")
+            return
+        i = keys.index(self._play_key)
+        sh = self._frame_shift(i, keys)
+        if sh is None:
+            self.lbl_jitter.setText("第 1 帧（无前帧对比）")
+            self.lbl_jitter.setStyleSheet("color:#888;font-size:12px;")
+            return
+        dx, dy, d = sh
+        warn = d >= 5.0
+        self.lbl_jitter.setText(
+            f"相对上帧 Δx={dx:+.1f} Δy={dy:+.1f}｜位移 {d:.1f} px"
+            + ("  ⚠ 抖动偏大" if warn else ""))
+        self.lbl_jitter.setStyleSheet(
+            ("color:#e74c3c;" if warn else "color:#2ecc71;")
+            + "font-size:12px;")
+
+    def _jitter_scan(self):
+        """扫描所有相邻可见帧的主体中心位移，列出抖动最大的帧"""
+        keys = self._play_visible_keys()
+        if len(keys) < 2:
+            QMessageBox.information(self, "抖动扫描", "至少需要 2 张可见帧")
+            return
+        if any(self.preview_cache.get(k) is None for k in keys):
+            QMessageBox.information(
+                self, "抖动扫描", "图片仍在加载，请稍候再试")
+            return
+        num = {it["key"]: it["number"] for it in self.items}
+        recs = []
+        for i in range(1, len(keys)):
+            sh = self._frame_shift(i, keys)
+            if sh is not None:
+                recs.append((i, keys[i], *sh))
+        if not recs:
+            QMessageBox.information(self, "抖动扫描", "未能检测到主体像素")
+            return
+        dists = [r[4] for r in recs]
+        avg = float(np.mean(dists))
+        top = sorted(recs, key=lambda r: -r[4])[:5]
+        lines = [
+            f"共 {len(keys)} 张可见帧，平均帧间位移 {avg:.2f} px",
+            "位移最大的帧（编号 / Δx / Δy / 距离）：",
+            "",
+        ]
+        for _, key, dx, dy, d in top:
+            lines.append(f"  帧 {num.get(key, '?'):>3}："
+                         f"Δx={dx:+6.1f}  Δy={dy:+6.1f}  {d:6.1f} px")
+        lines += ["", "判定参考：<2 px 很稳；2~5 px 轻微；≥5 px 建议对齐该帧"]
+        msg = "\n".join(lines)
+        self.status_text(
+            f"抖动扫描：平均 {avg:.2f}px，"
+            f"最大 {top[0][4]:.1f}px（帧 {num.get(top[0][1], '?')}）")
+        QMessageBox.information(self, "抖动扫描结果", msg)
 
     def _update_size_info(self):
         if not self.items:
@@ -1723,6 +2175,7 @@ class FrameExportPage(QWidget):
     def _on_layer_visibility(self, key: str, visible: bool):
         self._layer_visible[key] = visible
         self._update_size_info()
+        self._update_playbar()
         self._schedule_preview()
         self._save_timer.start()
 
@@ -1732,6 +2185,7 @@ class FrameExportPage(QWidget):
             self._layer_visible[r.key] = visible
         self.eye_all.setText("👁" if visible else "—")
         self._update_size_info()
+        self._update_playbar()
         self._schedule_preview()
         self._save_timer.start()
         self.status_text("全部图层已显示" if visible else "全部图层已隐藏")
@@ -1773,22 +2227,30 @@ class FrameExportPage(QWidget):
         pf = self._workspace_preview_factor(cw, ch)
         pw = max(1, int(cw * pf))
         ph = max(1, int(ch * pf))
-        sel = self.selected_key
-        sel_idx = next((i for i, it in enumerate(self.items)
-                        if it["key"] == sel), -1)
+        # 帧播放模式：只显示当前帧，不画选中框
+        play_amap = self._play_alpha_map()
+        play_mode = play_amap is not None
+        sel = None if play_mode else self.selected_key
+        sel_idx = -1 if play_mode else next(
+            (i for i, it in enumerate(self.items) if it["key"] == sel), -1)
 
-        def place(it: dict):
+        def place(it: dict, alpha: float = 1.0):
             """缩放后图层 + 它在预览画布上的左上角坐标"""
             im, cf = cache[it["key"]]
             pct = self._layer_scales.get(it["key"], 100) / 100.0
             sim = eu.scale_bgra(im, pct * pf / cf)
+            if alpha < 0.999:
+                a = sim[..., 3]
+                np.multiply(a, alpha, out=a, casting="unsafe")
             x, y = eu.centered_xy(pw, ph, sim.shape[1], sim.shape[0])
             ox, oy = self._layer_offsets.get(it["key"], (0.0, 0.0))
             return sim, x + int(round(ox * pf)), y + int(round(oy * pf))
 
         # 除选中层外全部是静态层：签名不变（=正在拖拽选中层）时直接复用
+        play_sig = (tuple(sorted(play_amap.items()))
+                    if play_amap is not None else None)
         static_sig = (
-            pw, ph, sel, tuple(sorted(cache.keys())),
+            pw, ph, sel, tuple(sorted(cache.keys())), play_sig,
             tuple((it["key"],
                    self._layer_scales.get(it["key"], 100),
                    round(float(self._layer_offsets.get(
@@ -1808,11 +2270,17 @@ class FrameExportPage(QWidget):
             for i, it in enumerate(self.items):
                 if it["key"] == sel:
                     continue
-                if not self._layer_visible.get(it["key"], True):
-                    continue
                 if cache.get(it["key"]) is None:
                     continue
-                sim, px, py = place(it)
+                if play_mode:
+                    alpha = play_amap.get(it["key"])
+                    if alpha is None:
+                        continue
+                else:
+                    if not self._layer_visible.get(it["key"], True):
+                        continue
+                    alpha = 1.0
+                sim, px, py = place(it, alpha)
                 if sel_idx < 0 or i < sel_idx:
                     eu.flatten_over(below, sim, px, py)
                 else:
@@ -1833,7 +2301,7 @@ class FrameExportPage(QWidget):
         shown = wc["static_shown"]
         sel_pm = None
         sel_rect = None
-        if (sel_idx >= 0 and sel in cache
+        if (not play_mode and sel_idx >= 0 and sel in cache
                 and self._layer_visible.get(sel, True)):
             sim, px, py = place(self.items[sel_idx])
             sel_pm = bgra_to_pixmap(sim, checker=False)
@@ -1842,6 +2310,13 @@ class FrameExportPage(QWidget):
         self.view.set_workspace_layers(
             wc["anchor"], wc["below_pm"], wc["above_pm"],
             sel_pm, sel_rect)
+        if play_mode:
+            keys = self._play_visible_keys()
+            i = keys.index(self._play_key) if self._play_key in keys else -1
+            icon = "⏸" if self._play_timer.isActive() else "⏯"
+            self.info_label.setText(
+                f"{icon} 帧播放 {i + 1}/{len(keys)}：{self._play_key}")
+            return
         total = len(self.items)
         hidden = total - len(self._visible_items())
         sel = self.selected_key or "-"
