@@ -3,6 +3,9 @@ __pycache__/
 *.py[cod]
 *.egg-info/
 
+# IDE
+.idea/
+
 # 生成产物：抽帧输出、抠图输出、精抠输出（可由程序重新生成）
 frames/
 **/matted/
@@ -13,3 +16,9 @@ session.json
 
 # rembg 模型缓存（在用户目录，正常不会出现在工程内）
 *.onnx
+
+# 打包产物
+build/
+dist/
+installer_output/
+nsis/
