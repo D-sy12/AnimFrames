@@ -27,7 +27,7 @@ import cv2
 import numpy as np
 
 from PySide6.QtCore import Qt, QThread, QTimer, Signal
-from PySide6.QtGui import QPixmap, QImage, QColor, QPainter, QCursor
+from PySide6.QtGui import QPixmap, QImage, QColor, QPainter, QCursor, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QPushButton,
     QLineEdit, QSlider, QFileDialog, QScrollArea, QMessageBox, QGroupBox,
@@ -518,6 +518,12 @@ class FrameMattingPage(QWidget):
         self._preview_timer.timeout.connect(self._live_preview)
 
         self._build_ui()
+
+        # A/D 键切换上一张/下一张
+        QShortcut(QKeySequence(Qt.Key_A), self, context=Qt.WindowShortcut,
+                  activated=self._prev_frame)
+        QShortcut(QKeySequence(Qt.Key_D), self, context=Qt.WindowShortcut,
+                  activated=self._next_frame)
 
     def showEvent(self, event):
         super().showEvent(event)
