@@ -21,10 +21,19 @@ from PySide6.QtWidgets import (
 from video_to_frames import extract_frames, FrameInfo
 
 
-# 会话存档文件（应用根目录）：记录第1页状态与帧目录，
+# 会话存档文件：记录第1页状态与帧目录，
 # 程序关闭后重开时恢复上次工作状态，直到用户换视频重新抽帧才被覆盖
-SESSION_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                            "session.json")
+# 打包后为可写：安装目录（如 Program Files）普通用户无写权限，
+# 存档改放 %LOCALAPPDATA%\AnimFrames；开发时仍放工程根目录
+if getattr(sys, "frozen", False):
+    _session_dir = os.path.join(
+        os.environ.get("LOCALAPPDATA", os.path.expanduser("~")),
+        "AnimFrames")
+    os.makedirs(_session_dir, exist_ok=True)
+    SESSION_PATH = os.path.join(_session_dir, "session.json")
+else:
+    SESSION_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "session.json")
 
 
 # ===================== 后台抽帧线程 =====================
@@ -207,7 +216,11 @@ class VideoToFramesPage(QWidget):
         out_group = QGroupBox("输出")
         og = QHBoxLayout(out_group)
         og.addWidget(QLabel("输出目录:"))
-        self.output_edit = QLineEdit("frames")
+        # 打包后相对路径会落到启动目录（可能只读），默认改到文档目录
+        _default_out = "frames" if not getattr(sys, "frozen", False) else \
+            os.path.join(os.path.expanduser("~"), "Documents",
+                         "AnimFrames", "frames")
+        self.output_edit = QLineEdit(_default_out)
         btn_browse_out = QPushButton("浏览...")
         btn_browse_out.clicked.connect(self._browse_output)
         og.addWidget(self.output_edit, 1)

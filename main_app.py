@@ -21,11 +21,18 @@ import os
 import json
 
 from PySide6.QtCore import Qt, QObject, QEvent
+from PySide6.QtGui import QIcon
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QStackedWidget, QLabel, QGroupBox, QSizePolicy,
     QAbstractSpinBox,
 )
+
+
+def _resource_path(name: str) -> str:
+    """资源文件路径：开发时取脚本目录，PyInstaller 打包后取 _MEIPASS"""
+    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base, name)
 
 
 class _SpinFocusCleaner(QObject):
@@ -190,6 +197,9 @@ class MainApp(QMainWindow):
 def main():
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
+    icon_path = _resource_path("app_icon.ico")
+    if os.path.exists(icon_path):
+        app.setWindowIcon(QIcon(icon_path))
     cleaner = _SpinFocusCleaner(app)     # 点击数值框外部即退出其编辑状态
     app.installEventFilter(cleaner)
     win = MainApp()

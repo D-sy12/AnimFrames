@@ -23,6 +23,61 @@ from PySide6.QtWidgets import (
 import numpy as np
 
 
+# ===================== 自绘勾选框（缩略图左上角） =====================
+
+class ThumbCheckBox(QCheckBox):
+    """深色半透明底 + 白边 + 白色勾形，在任何亮/暗图片上都清晰可见；
+    热区 26×26 大于视觉框 18×18，方便点中。"""
+
+    SIZE = 26      # 点击热区
+    BOX = 18       # 视觉勾选框
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedSize(self.SIZE, self.SIZE)
+        self.setCursor(Qt.PointingHandCursor)
+        self._hover = False
+
+    def hitButton(self, pos):
+        # 默认实现只认视觉指示框（中间18×18），热区边缘点击会被吞掉
+        # 改为整个控件区域均可点击
+        return self.rect().contains(pos)
+
+    def enterEvent(self, e):
+        self._hover = True
+        self.update()
+        super().enterEvent(e)
+
+    def leaveEvent(self, e):
+        self._hover = False
+        self.update()
+        super().leaveEvent(e)
+
+    def paintEvent(self, e):
+        from PySide6.QtGui import QPainter, QPen, QColor, QPainterPath
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        o = (self.SIZE - self.BOX) / 2.0
+        # 底框：深色半透明 + 白色描边（hover 变蓝）
+        p.setPen(QPen(QColor("#2d7ff9") if self._hover else QColor("white"), 2))
+        p.setBrush(QColor(25, 25, 25, 170))
+        p.drawRoundedRect(int(o), int(o), self.BOX, self.BOX, 4, 4)
+        if self.isChecked():
+            # 蓝色填充 + 白色勾
+            p.setBrush(QColor("#2d7ff9"))
+            p.setPen(QPen(QColor("#2d7ff9"), 2))
+            p.drawRoundedRect(int(o), int(o), self.BOX, self.BOX, 4, 4)
+            path = QPainterPath()
+            path.moveTo(o + 4.2, o + 9.2)
+            path.lineTo(o + 7.8, o + 13.0)
+            path.lineTo(o + 14.2, o + 5.2)
+            p.setPen(QPen(QColor("white"), 2.4, Qt.SolidLine,
+                          Qt.RoundCap, Qt.RoundJoin))
+            p.setBrush(Qt.NoBrush)
+            p.drawPath(path)
+        p.end()
+
+
 # ===================== 帧数据结构 =====================
 
 class FrameItem:
@@ -72,7 +127,14 @@ class ThumbCell(QFrame):
         self.img_label.setFixedSize(thumb_w, thumb_h)
         pix = QPixmap(filepath)
         if not pix.isNull():
-            pix = pix.scaled(thumb_w, thumb_h, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            # 填满裁剪（KeepAspectRatioByExpanding + 居中裁切），
+            # 避免比例不匹配时缩略图周围留出黑色矩形边
+            pix = pix.scaled(thumb_w, thumb_h,
+                             Qt.KeepAspectRatioByExpanding,
+                             Qt.SmoothTransformation)
+            x = max(0, (pix.width() - thumb_w) // 2)
+            y = max(0, (pix.height() - thumb_h) // 2)
+            pix = pix.copy(x, y, thumb_w, thumb_h)
         self._orig_pix = pix
         self._gray_pix = make_gray_pixmap(pix) if not pix.isNull() else pix
         self.img_label.setPixmap(self._gray_pix)
@@ -85,13 +147,9 @@ class ThumbCell(QFrame):
         lay.addWidget(self.caption, 0, Qt.AlignHCenter)
 
         # 左上角选择框：勾选=选中（点击图片本体仅预览，不改变选中）
-        self.chk = QCheckBox(self)
+        self.chk = ThumbCheckBox(self)
         self.chk.setToolTip("勾选=选中该帧")
-        self.chk.setStyleSheet(
-            "QCheckBox{background:rgba(20,20,20,190);border-radius:3px;"
-            "padding:1px;spacing:0px;}"
-            "QCheckBox::indicator{width:15px;height:15px;}")
-        self.chk.move(7, 7)
+        self.chk.move(4, 4)
         self.chk.raise_()
         self.chk.toggled.connect(
             lambda on: self.check_toggled.emit(self.index, bool(on)))
