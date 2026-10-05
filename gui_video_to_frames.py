@@ -18,7 +18,13 @@ from PySide6.QtWidgets import (
     QScrollArea, QFrame, QMessageBox, QGroupBox, QSplitter, QSizePolicy,
 )
 
-from video_to_frames import extract_frames
+from video_to_frames import extract_frames, FrameInfo
+
+
+# 会话存档文件（应用根目录）：记录第1页状态与帧目录，
+# 程序关闭后重开时恢复上次工作状态，直到用户换视频重新抽帧才被覆盖
+SESSION_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "session.json")
 
 
 # ===================== 后台抽帧线程 =====================
@@ -375,7 +381,87 @@ class VideoToFramesPage(QWidget):
         self.shared_state.pop("matted_dir", None)
         self.shared_state.pop("refined_dir", None)
         self.shared_state.pop("colored_dir", None)
+        self.shared_state.pop("adjusted_dir", None)
+        self._save_session()
         self.frames_extracted.emit(output_dir)
+
+    # ---------------- 会话存档 ----------------
+
+    def _save_session(self):
+        """抽帧完成后保存第1页状态，供下次启动恢复"""
+        if not self.thread:
+            return
+        p = self.thread.params
+        data = {
+            "video_path": os.path.abspath(p["video_path"]),
+            "frames_dir": os.path.abspath(p["output_dir"]),
+            "mode": p["mode"],
+            "interval": p["interval"],
+            "start_time": p["start_time"],
+            "end_time": p["end_time"],
+            "img_format": p["img_format"],
+            "prefix": p["prefix"],
+            "dedup": p["dedup"],
+            "similarity_threshold": p["similarity_threshold"],
+        }
+        try:
+            with open(SESSION_PATH, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=1)
+        except OSError:
+            pass
+
+    def restore_session(self, data: dict) -> bool:
+        """从存档恢复第1页（回填参数 + 加载已有帧，不重新抽帧）"""
+        video = data.get("video_path", "")
+        frames_dir = data.get("frames_dir", "")
+        info_path = os.path.join(frames_dir, "frames_info.json")
+        if not (video and os.path.isfile(video)):
+            return False
+        if not os.path.isfile(info_path):
+            return False
+        try:
+            with open(info_path, "r", encoding="utf-8") as f:
+                info_data = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            return False
+
+        # 回填控件
+        self.video_path_edit.setText(video)
+        self.output_edit.setText(frames_dir)
+        mode_id = {"all": 0, "interval": 1, "time": 2}.get(
+            data.get("mode", "all"), 0)
+        self.mode_group.button(mode_id).setChecked(True)
+        self._on_mode_changed()
+        self.interval_spin.setValue(data.get("interval", 1))
+        self.start_spin.setValue(data.get("start_time", 0))
+        end_time = data.get("end_time")
+        self.end_spin.setValue(end_time if end_time else 0)
+        idx = self.format_combo.findText(data.get("img_format", "png"))
+        if idx >= 0:
+            self.format_combo.setCurrentIndex(idx)
+        self.prefix_edit.setText(data.get("prefix", "frame"))
+        self.dedup_check.setChecked(data.get("dedup", True))
+        self.threshold_slider.setValue(
+            int(data.get("similarity_threshold", 95)))
+
+        # 重建帧列表与预览（仅非重复帧有文件）
+        self.output_dir = frames_dir
+        self.frames_info = [
+            FrameInfo(**fr) for fr in info_data.get("frames", [])
+            if not fr.get("is_duplicate")]
+        total = info_data.get("exported_count", len(self.frames_info))
+        skipped = info_data.get("skipped_duplicates", 0)
+        self.summary_label.setText(
+            f"已恢复上次会话：保存 {total} 帧  |  跳过重复 {skipped} 帧  →  "
+            f"{os.path.abspath(frames_dir)}")
+        self.status_label.setText("已恢复上次的工作进度")
+        self.progress_bar.setValue(100)
+        self._load_preview()
+
+        self.shared_state["frames_dir"] = os.path.abspath(frames_dir)
+        self.shared_state["frames_info"] = self.frames_info
+        self.shared_state["video_path"] = video
+        return True
 
     def _on_failed(self, err: str):
         self.btn_start.setEnabled(True)
