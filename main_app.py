@@ -17,11 +17,33 @@
 
 import sys
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QObject, QEvent
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
     QPushButton, QStackedWidget, QLabel, QGroupBox, QSizePolicy,
+    QAbstractSpinBox,
 )
+
+
+class _SpinFocusCleaner(QObject):
+    """点击数值框以外的位置时退出其编辑状态。
+
+    Qt 默认行为：数值框（QSpinBox/QDoubleSpinBox）获得焦点后，点击其他
+    地方不会失去焦点，键盘输入会一直留在框内。此过滤器在全局鼠标按下时
+    检查：若焦点在数值框内而点击目标不在其中，则清除焦点（提交当前值）。
+    """
+
+    def eventFilter(self, obj, event):
+        if event.type() == QEvent.MouseButtonPress:
+            w = QApplication.focusWidget()
+            while w is not None and not isinstance(w, QAbstractSpinBox):
+                w = w.parentWidget()          # 焦点常在内部 lineEdit 上
+            if w is None:
+                return False
+            # 事件目标可能是 QWindow（点窗口框架/原生对话框），非 QWidget
+            if not isinstance(obj, QWidget) or not w.isAncestorOf(obj):
+                w.clearFocus()
+        return False
 
 from gui_video_to_frames import VideoToFramesPage
 from gui_frame_selector import FrameSelectorPage
@@ -163,6 +185,8 @@ class MainApp(QMainWindow):
 def main():
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
+    cleaner = _SpinFocusCleaner(app)     # 点击数值框外部即退出其编辑状态
+    app.installEventFilter(cleaner)
     win = MainApp()
     win.show()
     sys.exit(app.exec())

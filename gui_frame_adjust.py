@@ -25,11 +25,13 @@ from typing import Optional, List, Dict, Tuple
 import numpy as np
 import cv2
 
-from PySide6.QtCore import Qt, QTimer, Signal, QThread, QRectF
-from PySide6.QtGui import QKeySequence, QShortcut, QPixmap, QPainter, QColor
+from PySide6.QtCore import Qt, QTimer, Signal, QThread, QRectF, QSize
+from PySide6.QtGui import (QKeySequence, QShortcut, QPixmap, QPainter, QColor,
+                           QIcon, QPainterPath, QPen)
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QScrollArea,
-    QGroupBox, QSpinBox, QToolButton, QFrame, QButtonGroup, QFileDialog,
+    QGroupBox, QDoubleSpinBox, QToolButton, QFrame, QButtonGroup,
+    QFileDialog,
 )
 
 from gui_frame_matting import (imread_unicode, imwrite_unicode,
@@ -482,12 +484,51 @@ class _BakeWorker(QThread):
         self.done.emit(ok, fail)
 
 
+# ===================== 小眼睛矢量图标 =====================
+
+_EYE_ICONS: Dict[bool, "QIcon"] = {}
+
+def eye_icon(visible: bool, px: int = 18) -> "QIcon":
+    """矢量小眼睛：显示=亮色睁眼，隐藏=暗色眼+斜杠（替代观感差的 emoji）"""
+    icon = _EYE_ICONS.get(visible)
+    if icon is not None:
+        return icon
+    pm = QPixmap(px, px)
+    pm.fill(Qt.transparent)
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.Antialiasing)
+    color = QColor("#ecf0f1") if visible else QColor("#7f8c8d")
+    pen = QPen(color, max(1.3, px / 13.0), Qt.SolidLine,
+               Qt.RoundCap, Qt.RoundJoin)
+    s = px / 24.0                       # 24×24 视口等比映射
+    path = QPainterPath()               # 杏仁形眼眶（左右尖角）
+    path.moveTo(3 * s, 12 * s)
+    path.quadTo(12 * s, 4.5 * s, 21 * s, 12 * s)
+    path.quadTo(12 * s, 19.5 * s, 3 * s, 12 * s)
+    p.setPen(pen)
+    p.setBrush(Qt.NoBrush)
+    p.drawPath(path)
+    r = 3.1 * s                         # 瞳孔
+    p.setPen(Qt.NoPen)
+    p.setBrush(color)
+    p.drawEllipse(QRectF(12 * s - r, 12 * s - r, 2 * r, 2 * r))
+    if not visible:                     # 斜杠
+        p.setBrush(Qt.NoBrush)
+        p.setPen(pen)
+        p.drawLine(int(4.5 * s), int(19.5 * s),
+                   int(19.5 * s), int(4.5 * s))
+    p.end()
+    icon = QIcon(pm)
+    _EYE_ICONS[visible] = icon
+    return icon
+
+
 # ===================== 图层列表行 =====================
 
 class LayerRow(QFrame):
-    """👁 显示开关 + 多选框 + 缩略图 + 名称尺寸 + 撤销 + 独立缩放%"""
+    """眼睛显示开关 + 缩略图 + 名称尺寸 + 撤销 + 独立缩放%"""
     clicked = Signal(str)
-    scale_changed = Signal(str, int)
+    scale_changed = Signal(str, float)
     visibility_changed = Signal(str, bool)
     undo_clicked = Signal(str)
 
@@ -511,9 +552,9 @@ class LayerRow(QFrame):
         self.eye.setCursor(Qt.PointingHandCursor)
         self.eye.setToolTip("显示 / 隐藏该图片（隐藏后不能编辑，"
                             "不参与框选与整组操作）")
+        self.eye.setIconSize(QSize(18, 18))
         self.eye.setStyleSheet(
-            "QToolButton{background:transparent;border:none;"
-            "font-size:15px;color:#ecf0f1;}"
+            "QToolButton{background:transparent;border:none;}"
             "QToolButton:hover{background:#3a3a3a;border-radius:4px;}")
         self.eye.toggled.connect(self._on_eye)
         lay.addWidget(self.eye)
@@ -544,15 +585,17 @@ class LayerRow(QFrame):
             lambda: self.undo_clicked.emit(self.key))
         lay.addWidget(self.btn_undo)
 
-        self.spin = QSpinBox()
-        self.spin.setRange(5, 400)
-        self.spin.setValue(pct)
+        self.spin = QDoubleSpinBox()
+        self.spin.setRange(5.0, 400.0)
+        self.spin.setDecimals(1)
+        self.spin.setSingleStep(1.0)
+        self.spin.setValue(float(pct))
         self.spin.setSuffix(" %")
-        self.spin.setFixedWidth(78)
+        self.spin.setFixedWidth(86)
         self.spin.setCursor(Qt.ArrowCursor)
-        self.spin.setToolTip("该图层独立缩放")
+        self.spin.setToolTip("该图层独立缩放（精确到 0.1%）")
         self.spin.valueChanged.connect(
-            lambda v: self.scale_changed.emit(self.key, int(v)))
+            lambda v: self.scale_changed.emit(self.key, float(v)))
         lay.addWidget(self.spin)
 
         self.set_visible(visible, emit_signal=False)
@@ -566,7 +609,7 @@ class LayerRow(QFrame):
         self.eye.blockSignals(True)
         self.eye.setChecked(visible)
         self.eye.blockSignals(False)
-        self.eye.setText("👁" if visible else "—")
+        self.eye.setIcon(eye_icon(visible))
         self.spin.setEnabled(visible)      # 隐藏图层不能编辑
         if emit_signal:
             self.visibility_changed.emit(self.key, visible)
@@ -634,8 +677,9 @@ class RefRow(QFrame):
         self.eye.setFixedSize(26, 26)
         self.eye.setCursor(Qt.PointingHandCursor)
         self.eye.setToolTip("显示 / 隐藏参考图（参考图不能编辑，不参与导出）")
+        self.eye.setIconSize(QSize(16, 16))
         self.eye.setStyleSheet(
-            "QToolButton{background:transparent;border:none;font-size:14px;}"
+            "QToolButton{background:transparent;border:none;}"
             "QToolButton:hover{background:#3a3f4b;border-radius:4px;}")
         self.eye.clicked.connect(self._on_eye)
         lay.addWidget(self.eye)
@@ -669,7 +713,7 @@ class RefRow(QFrame):
             self.visibility_changed.emit(visible)
 
     def _update_eye(self):
-        self.eye.setText("👁" if self._visible else "—")
+        self.eye.setIcon(eye_icon(self._visible))
 
     def set_thumbnail(self, bgra: np.ndarray):
         pm = bgra_to_pixmap(bgra)
@@ -735,9 +779,27 @@ class FrameAdjustPage(QWidget):
         self._resize_timer.setSingleShot(True)
         self._resize_timer.setInterval(150)
         self._resize_timer.timeout.connect(self._on_view_resized)
+        # 键盘连调（WASD/QE）期间把目标图层当动态层渲染，停手后恢复静态
+        self._key_idle_timer = QTimer(self)
+        self._key_idle_timer.setSingleShot(True)
+        self._key_idle_timer.setInterval(250)
+        self._key_idle_timer.timeout.connect(self._end_key_drag)
 
         self._build_ui()
         QShortcut(QKeySequence("Ctrl+Z"), self, self._undo_selected)
+        # WASD 微调位置（1px/次），QE 调大小（步进用户可设，默认1%）
+        QShortcut(QKeySequence(Qt.Key_W), self, context=Qt.WindowShortcut,
+                  activated=lambda: self._key_nudge(0, -1))
+        QShortcut(QKeySequence(Qt.Key_A), self, context=Qt.WindowShortcut,
+                  activated=lambda: self._key_nudge(-1, 0))
+        QShortcut(QKeySequence(Qt.Key_S), self, context=Qt.WindowShortcut,
+                  activated=lambda: self._key_nudge(0, 1))
+        QShortcut(QKeySequence(Qt.Key_D), self, context=Qt.WindowShortcut,
+                  activated=lambda: self._key_nudge(1, 0))
+        QShortcut(QKeySequence(Qt.Key_Q), self, context=Qt.WindowShortcut,
+                  activated=lambda: self._key_scale(-1))
+        QShortcut(QKeySequence(Qt.Key_E), self, context=Qt.WindowShortcut,
+                  activated=lambda: self._key_scale(1))
 
     # ---------- UI ----------
 
@@ -813,6 +875,17 @@ class FrameAdjustPage(QWidget):
         self.btn_undo_sel.clicked.connect(self._undo_selected)
         self.btn_undo_sel.setEnabled(False)
         rowt.addWidget(self.btn_undo_sel)
+        rowt.addWidget(QLabel(" QE步进:"))
+        self.key_step_spin = QDoubleSpinBox()
+        self.key_step_spin.setRange(0.1, 10.0)
+        self.key_step_spin.setSingleStep(0.1)
+        self.key_step_spin.setDecimals(1)
+        self.key_step_spin.setValue(1.0)
+        self.key_step_spin.setSuffix("%")
+        self.key_step_spin.setToolTip(
+            "Q/E 键每按一次的缩放变化量（0.1%~10%，默认1%）\n"
+            "W/A/S/D 键每按一次移动 1px（均作用于当前操作图/框选组）")
+        rowt.addWidget(self.key_step_spin)
         rowt.addStretch()
         tf.addLayout(rowt)
 
@@ -854,17 +927,18 @@ class FrameAdjustPage(QWidget):
         right.addWidget(tool_box, 0)
 
         # ---- 图层列表 ----
-        list_box = QGroupBox("所有图片（👁=是否显示，点击行选中）")
+        list_box = QGroupBox("所有图片（眼睛=是否显示，点击行选中）")
         gl = QVBoxLayout(list_box)
         gl.setContentsMargins(4, 6, 4, 4)
         head = QHBoxLayout()
         self.eye_all = QToolButton()
-        self.eye_all.setText("👁")
+        self.eye_all.setIcon(eye_icon(True))
         self.eye_all.setFixedSize(28, 28)
         self.eye_all.setCursor(Qt.PointingHandCursor)
         self.eye_all.setToolTip("全部显示 / 全部隐藏")
+        self.eye_all.setIconSize(QSize(18, 18))
         self.eye_all.setStyleSheet(
-            "QToolButton{background:transparent;border:none;font-size:15px;}"
+            "QToolButton{background:transparent;border:none;}"
             "QToolButton:hover{background:#3a3f4b;border-radius:4px;}")
         self.eye_all.clicked.connect(self._toggle_all_visible)
         head.addWidget(self.eye_all)
@@ -1268,11 +1342,13 @@ class FrameAdjustPage(QWidget):
         row = next((r for r in self.layer_rows if r.key == key), None)
         if row is not None:
             disp = max(row.spin.minimum(),
-                       min(row.spin.maximum(), int(round(pct))))
+                       min(row.spin.maximum(), float(pct)))
             row.spin.blockSignals(True)
             row.spin.setValue(disp)
             row.spin.blockSignals(False)
-        self._undo_coalesce[key] = time.monotonic()
+        # 撤销是一个明确的断点：之后的任何改动都开新撤销点
+        # （若沿用合并窗口，撤销后 0.8s 内的改动会丢失"回到撤销后状态"的快照）
+        self._undo_coalesce[key] = 0.0
         self._ws_cache = None
         self._dirty.add(key)
         self._update_undo_ui()
@@ -1292,7 +1368,7 @@ class FrameAdjustPage(QWidget):
         self.btn_undo_sel.setEnabled(n > 0)
         self.btn_undo_sel.setText(f"↩ 撤销本图（{n}）" if n else "↩ 撤销本图")
 
-    def _on_layer_scale_changed(self, key: str, pct: int):
+    def _on_layer_scale_changed(self, key: str, pct: float):
         # 键盘连按/滚轮/拖拽产生的连续变化合并为一个撤销点
         now = time.monotonic()
         if now - self._undo_coalesce.get(key, 0.0) > 0.8:
@@ -1327,7 +1403,7 @@ class FrameAdjustPage(QWidget):
             self.selected_keys = set()       # 全隐藏：多选组清空
             for r in self.layer_rows:
                 r.set_marqueed(False)
-        self.eye_all.setText("👁" if visible else "—")
+        self.eye_all.setIcon(eye_icon(visible))
         self._schedule_preview()
         self._save_timer.start()
         self.status_text("全部图层已显示" if visible else "全部图层已隐藏")
@@ -1479,7 +1555,7 @@ class FrameAdjustPage(QWidget):
                             if r.key == k), None)
                 if row is not None:
                     cur = row.spin.value()
-                    new = max(5, min(400, int(round(cur + dx * 0.5))))
+                    new = max(5.0, min(400.0, round(cur + dx * 0.5, 1)))
                     if new != cur:
                         row.spin.setValue(new)  # 触发 changed → 预览+保存
 
@@ -1501,6 +1577,76 @@ class FrameAdjustPage(QWidget):
             self._render_workspace()
             self._save_timer.start()
             self.status_text(f"{changed} 张图片已回到画布中心")
+
+    # ---------- 键盘微调（WASD 移动 / QE 缩放） ----------
+
+    def _key_targets(self) -> List[str]:
+        """键盘控制的目标图层（同拖拽语义：当前图/框选组，隐藏不可编辑）"""
+        keys = self._drag_keys()
+        if not keys and self.selected_key:
+            self.status_text("（已隐藏，隐藏的图层不能编辑）")
+        return keys
+
+    def _begin_key_drag(self, keys: List[str]):
+        """键盘连调期间目标图层按动态层渲染（命中缓存，不重建静态链）"""
+        self._drag_group = frozenset(keys)
+        self._key_idle_timer.start()      # 停手 250ms 后 _end_key_drag 恢复
+
+    def _end_key_drag(self):
+        if self._drag_group:
+            self._drag_group = frozenset()
+            self._render_workspace()
+
+    def _key_nudge(self, dx: float, dy: float):
+        """WASD：当前图（或框选组）每次移动 1px，连按合并一个撤销点"""
+        keys = self._key_targets()
+        if not keys:
+            return
+        now = time.monotonic()
+        for k in keys:
+            if now - self._undo_coalesce.get(k, 0.0) > 0.8:
+                self._push_undo(k)
+            self._undo_coalesce[k] = now
+            ox, oy = self._layer_offsets.get(k, (0.0, 0.0))
+            self._layer_offsets[k] = [ox + dx, oy + dy]
+            self._dirty.add(k)
+        self._begin_key_drag(keys)
+        self._render_workspace()
+        self._save_timer.start()
+
+    def _key_scale(self, direction: int):
+        """QE：当前图（或框选组）缩放 ±步进%（浮点累加，5%~400% 封顶）"""
+        keys = self._key_targets()
+        if not keys:
+            return
+        step = self.key_step_spin.value() * direction
+        now = time.monotonic()
+        changed = False
+        last_pct = None
+        for k in keys:
+            old = self._layer_scales.get(k, 100.0)
+            new = max(5.0, min(400.0, old + step))
+            if new == old:
+                continue
+            if now - self._undo_coalesce.get(k, 0.0) > 0.8:
+                self._push_undo(k)
+            self._undo_coalesce[k] = now
+            self._layer_scales[k] = new
+            self._dirty.add(k)
+            row = next((r for r in self.layer_rows if r.key == k), None)
+            if row is not None:      # spin 与浮点值同步（0.1% 精度）
+                row.spin.blockSignals(True)
+                row.spin.setValue(max(row.spin.minimum(),
+                                      min(row.spin.maximum(),
+                                          float(new))))
+                row.spin.blockSignals(False)
+            last_pct = new
+            changed = True
+        if changed:
+            self._begin_key_drag(keys)
+            self._render_workspace()
+            self._save_timer.start()
+            self.status_text(f"缩放 {last_pct:.1f}%")
 
     # ---------- 工作台渲染 ----------
 

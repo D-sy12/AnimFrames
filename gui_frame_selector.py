@@ -205,6 +205,11 @@ class FrameSelectorPage(QWidget):
                   activated=lambda: self._step_preview(1))
         QShortcut(QKeySequence(Qt.Key_Space), self, context=Qt.WindowShortcut,
                   activated=self._toggle_play)
+        # Q/E 选中/取消选中当前预览帧
+        QShortcut(QKeySequence(Qt.Key_Q), self, context=Qt.WindowShortcut,
+                  activated=lambda: self._set_current_selected(True))
+        QShortcut(QKeySequence(Qt.Key_E), self, context=Qt.WindowShortcut,
+                  activated=lambda: self._set_current_selected(False))
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -368,7 +373,7 @@ class FrameSelectorPage(QWidget):
         rlay.addWidget(func_box, 0)
 
         # 帧选择网格
-        grid_box = QGroupBox("所有帧（左上角勾选=选中  |  单击=预览  |  A/D=上一张/下一张  |  空格=播放/暂停  |  黄框=当前预览）")
+        grid_box = QGroupBox("所有帧（左上角勾选=选中  |  单击=预览  |  A/D=上一张/下一张  |  Q/E=选中/取消选中  |  空格=播放/暂停  |  黄框=当前预览）")
         gl = QVBoxLayout(grid_box)
         self.scroll = QScrollArea()
         self.scroll.setWidgetResizable(True)
@@ -502,6 +507,12 @@ class FrameSelectorPage(QWidget):
             self.frames[index].selected = checked
             self.cells[index].set_selected(checked)
             self._update_count()
+
+    def _set_current_selected(self, sel: bool):
+        """Q/E：选中/取消选中当前预览帧（黄框所在帧）"""
+        idx = self._current_cell_idx
+        if 0 <= idx < len(self.frames):
+            self._on_cell_check(idx, sel)
 
     def _set_all(self, value: bool):
         for f in self.frames:

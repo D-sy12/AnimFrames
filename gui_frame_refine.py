@@ -662,7 +662,7 @@ class FrameRefinePage(QWidget):
         rlay.addWidget(op_box, 0)
 
         # 操作提示（从左侧工作区底部移入）
-        hint = QLabel("提示：左键拖动涂抹；滚轮缩放（以光标为中心）；中键或空格+左键拖动平移；双击适应窗口；Ctrl+Z 撤销；[ ] 调笔刷")
+        hint = QLabel("提示：左键拖动涂抹；滚轮缩放（以光标为中心）；中键或空格+左键拖动平移；双击适应窗口；Ctrl+Z 撤销；[ ] 调笔刷；A/D 切换图片")
         hint.setWordWrap(True)
         hint.setStyleSheet("color:#7f8c8d;font-size:11px;")
         rlay.addWidget(hint, 0)
@@ -701,6 +701,11 @@ class FrameRefinePage(QWidget):
         QShortcut(QKeySequence("Ctrl+Z"), self, self._undo)
         QShortcut(QKeySequence("["), self, lambda: self._adjust_brush(-4))
         QShortcut(QKeySequence("]"), self, lambda: self._adjust_brush(4))
+        # A/D 键切换上一张/下一张
+        QShortcut(QKeySequence(Qt.Key_A), self, context=Qt.WindowShortcut,
+                  activated=self._prev_image)
+        QShortcut(QKeySequence(Qt.Key_D), self, context=Qt.WindowShortcut,
+                  activated=self._next_image)
 
     # ---------- 供画布查询的状态 ----------
 

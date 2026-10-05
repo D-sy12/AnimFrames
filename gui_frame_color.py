@@ -25,7 +25,7 @@ import numpy as np
 import cv2
 
 from PySide6.QtCore import Qt, QTimer, Signal, QThread
-from PySide6.QtGui import QPixmap
+from PySide6.QtGui import QPixmap, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QPushButton,
     QSlider, QScrollArea, QGroupBox, QRadioButton, QButtonGroup,
@@ -364,6 +364,12 @@ class FrameColorPage(QWidget):
         self._preview_timer.timeout.connect(self._update_preview)
 
         self._build_ui()
+
+        # A/D 键切换上一张/下一张
+        QShortcut(QKeySequence(Qt.Key_A), self, context=Qt.WindowShortcut,
+                  activated=self._prev_image)
+        QShortcut(QKeySequence(Qt.Key_D), self, context=Qt.WindowShortcut,
+                  activated=self._next_image)
 
     # ---------- UI ----------
 
