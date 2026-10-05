@@ -9,13 +9,15 @@
   4. 图片精抠
   5. 色调统一
   6. 调整位置
-  7. 导出图片（开发中）
+  7. 导出图片
 
 运行：
     python main_app.py11
 """
 
 import sys
+import os
+import json
 
 from PySide6.QtCore import Qt, QObject, QEvent
 from PySide6.QtWidgets import (
@@ -45,38 +47,13 @@ class _SpinFocusCleaner(QObject):
                 w.clearFocus()
         return False
 
-from gui_video_to_frames import VideoToFramesPage
+from gui_video_to_frames import VideoToFramesPage, SESSION_PATH
 from gui_frame_selector import FrameSelectorPage
 from gui_frame_matting import FrameMattingPage
 from gui_frame_refine import FrameRefinePage
 from gui_frame_color import FrameColorPage
 from gui_frame_adjust import FrameAdjustPage
-
-
-# ===================== 占位页面（待开发模块） =====================
-
-class PlaceholderPage(QWidget):
-    def __init__(self, title: str, desc: str, parent=None):
-        super().__init__(parent)
-        self.setStyleSheet("QWidget{background:#2b2b2b;}")
-        lay = QVBoxLayout(self)
-        lay.setAlignment(Qt.AlignCenter)
-
-        title_lbl = QLabel(title)
-        title_lbl.setStyleSheet("font-size: 28px; font-weight: bold; color: #2d7ff9; background:transparent;")
-        title_lbl.setAlignment(Qt.AlignCenter)
-        lay.addWidget(title_lbl)
-
-        desc_lbl = QLabel(desc)
-        desc_lbl.setStyleSheet("font-size: 15px; color: #bdc3c7; margin-top: 12px; background:transparent;")
-        desc_lbl.setAlignment(Qt.AlignCenter)
-        desc_lbl.setWordWrap(True)
-        lay.addWidget(desc_lbl)
-
-        tip = QLabel("🚧 该功能正在开发中...")
-        tip.setStyleSheet("font-size: 13px; color: #7f8c8d; margin-top: 24px; background:transparent;")
-        tip.setAlignment(Qt.AlignCenter)
-        lay.addWidget(tip)
+from gui_frame_export import FrameExportPage
 
 
 # ===================== 主窗口 =====================
@@ -102,7 +79,30 @@ class MainApp(QMainWindow):
         self.shared_state: dict = {}
 
         self._build_ui()
+        self._restore_session()
         self._switch_page(0)
+
+    def _restore_session(self):
+        """启动时恢复上次会话：只要不换视频，重开程序回到离开时的状态。
+
+        各下游页面的产物（selected_frames/matted/refined/colored/adjusted
+        及各自 info json）本就持久化在帧目录里，这里只需重建 shared_state
+        并让第1页回填，后续页面进入时会自行从磁盘恢复。
+        """
+        try:
+            with open(SESSION_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            return
+        if not self.page_video.restore_session(data):
+            return
+        # 探测下游产物目录，存在则挂到共享状态
+        frames_dir = self.shared_state.get("frames_dir", "")
+        for key, sub in (("matted_dir", "matted"), ("refined_dir", "refined"),
+                         ("colored_dir", "colored"), ("adjusted_dir", "adjusted")):
+            d = os.path.join(frames_dir, sub)
+            if os.path.isdir(d):
+                self.shared_state[key] = d
 
     def _build_ui(self):
         central = QWidget()
@@ -171,9 +171,7 @@ class MainApp(QMainWindow):
         self.stack.addWidget(self.page_adjust)
 
         # 页面 7：导出图片
-        self.page_export = PlaceholderPage(
-            "导出图片",
-            "拼图 / 动画预览 / 分辨率调整 / 导出 PNG 序列或雪碧图")
+        self.page_export = FrameExportPage(self.shared_state)
         self.stack.addWidget(self.page_export)
 
     def _switch_page(self, idx: int):

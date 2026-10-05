@@ -108,16 +108,17 @@ def extract_frames(
         is_old_frame = (
             fn_lower.startswith(prefix.lower() + "_")
             and fn_lower.endswith(old_exts))
-        is_old_json = fn in ("frames_info.json", "selected_frames.json")
+        is_old_json = fn in ("frames_info.json", "selected_frames.json",
+                             "export_info.json")
         if is_old_frame or is_old_json:
             try:
                 os.remove(os.path.join(output_dir, fn))
             except OSError:
                 pass
 
-    # 清理下游模块产物（批量抠图 matted/、图片精抠 refined/、色调统一 colored/），
-    # 否则换新视频重新抽帧后，旧视频的产物会残留并被下游页面读到
-    for sub in ("matted", "refined", "colored"):
+    # 清理下游模块产物（批量抠图 matted/、图片精抠 refined/、色调统一 colored/、
+    # 调整位置 adjusted/），否则换新视频重新抽帧后，旧视频的产物会残留并被下游页面读到
+    for sub in ("matted", "refined", "colored", "adjusted"):
         sub_dir = os.path.join(output_dir, sub)
         if os.path.isdir(sub_dir):
             shutil.rmtree(sub_dir, ignore_errors=True)
@@ -190,11 +191,17 @@ def extract_frames(
             )
             all_records.append(record)
         else:
-            # 保存图片
+            # 保存图片（cv2.imwrite 对中文路径会静默失败，
+            # 必须走 imencode + tofile）
             if img_format == "jpg":
-                cv2.imwrite(filepath, frame, [cv2.IMWRITE_JPEG_QUALITY, jpg_quality])
+                ok, buf = cv2.imencode(
+                    ".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, jpg_quality])
             else:
-                cv2.imwrite(filepath, frame)  # PNG 默认无损
+                ok, buf = cv2.imencode(".png", frame)  # PNG 默认无损
+            if not ok:
+                print(f"[警告] 第 {frame_no} 帧编码失败，跳过")
+                continue
+            buf.tofile(filepath)
 
             record = FrameInfo(
                 index=export_index,
