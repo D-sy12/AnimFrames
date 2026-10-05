@@ -12,12 +12,12 @@ import json
 from typing import List
 
 from PySide6.QtCore import Qt, QTimer, Signal
-from PySide6.QtGui import QPixmap, QImage
+from PySide6.QtGui import QPixmap, QImage, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QLabel, QPushButton, QLineEdit, QSpinBox, QSlider, QFileDialog, QScrollArea,
     QFrame, QMessageBox, QGroupBox, QSizePolicy, QSplitter, QRadioButton,
-    QButtonGroup,
+    QButtonGroup, QCheckBox,
 )
 
 import numpy as np
@@ -49,7 +49,7 @@ def make_gray_pixmap(pix: QPixmap) -> QPixmap:
 
 
 class ThumbCell(QFrame):
-    clicked = Signal(int)
+    check_toggled = Signal(int, bool)   # 左上角选择框勾选变化（index, checked）
 
     def __init__(self, index: int, filepath: str, thumb_w: int = 110, thumb_h: int = 80):
         super().__init__()
@@ -84,10 +84,26 @@ class ThumbCell(QFrame):
         self.caption.setStyleSheet("font-size: 10px; color: #999;")
         lay.addWidget(self.caption, 0, Qt.AlignHCenter)
 
+        # 左上角选择框：勾选=选中（点击图片本体仅预览，不改变选中）
+        self.chk = QCheckBox(self)
+        self.chk.setToolTip("勾选=选中该帧")
+        self.chk.setStyleSheet(
+            "QCheckBox{background:rgba(20,20,20,190);border-radius:3px;"
+            "padding:1px;spacing:0px;}"
+            "QCheckBox::indicator{width:15px;height:15px;}")
+        self.chk.move(7, 7)
+        self.chk.raise_()
+        self.chk.toggled.connect(
+            lambda on: self.check_toggled.emit(self.index, bool(on)))
+
         self._update_style()
 
     def set_selected(self, sel: bool):
         self._selected = sel
+        if self.chk.isChecked() != sel:      # 程序化改动同步勾选框（不递归）
+            self.chk.blockSignals(True)
+            self.chk.setChecked(sel)
+            self.chk.blockSignals(False)
         self._update_style()
 
     def set_current(self, cur: bool):
@@ -129,7 +145,7 @@ class ThumbCell(QFrame):
 # ===================== 单击网格容器 =====================
 
 class GridContainer(QWidget):
-    """单击切换选中并在预览区显示的缩略图网格容器"""
+    """单击缩略图在预览区显示（勾选框负责选中，点击本体不再切换选中）"""
 
     def __init__(self, page, parent=None):
         super().__init__(parent)
@@ -138,16 +154,17 @@ class GridContainer(QWidget):
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
             cell = self.childAt(event.position().toPoint())
+            if isinstance(cell, QCheckBox):    # 点击选择框：交给复选框自身
+                super().mousePressEvent(event)
+                return
             # 向上查找 ThumbCell
             while cell is not None and not isinstance(cell, ThumbCell):
                 cell = cell.parentWidget()
             if isinstance(cell, ThumbCell):
-                idx = cell.index
-                self.page.frames[idx].selected = not self.page.frames[idx].selected
-                cell.set_selected(self.page.frames[idx].selected)
-                self.page._update_count()
-                self.page._preview_frame(idx)
-            event.accept()
+                self.page._preview_frame(cell.index)   # 单击仅预览
+                event.accept()
+                return
+            event.ignore()
         else:
             super().mousePressEvent(event)
 
@@ -180,6 +197,14 @@ class FrameSelectorPage(QWidget):
         self._resize_timer.timeout.connect(self._do_resize_rebuild)
 
         self._build_ui()
+
+        # 键盘快捷键：A/D 切换上一张/下一张预览，空格 播放/暂停
+        QShortcut(QKeySequence(Qt.Key_A), self, context=Qt.WindowShortcut,
+                  activated=lambda: self._step_preview(-1))
+        QShortcut(QKeySequence(Qt.Key_D), self, context=Qt.WindowShortcut,
+                  activated=lambda: self._step_preview(1))
+        QShortcut(QKeySequence(Qt.Key_Space), self, context=Qt.WindowShortcut,
+                  activated=self._toggle_play)
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -343,7 +368,7 @@ class FrameSelectorPage(QWidget):
         rlay.addWidget(func_box, 0)
 
         # 帧选择网格
-        grid_box = QGroupBox("所有帧（单击切换选中  |  彩色=选中，灰色=未选中  |  黄框=当前预览）")
+        grid_box = QGroupBox("所有帧（左上角勾选=选中  |  单击=预览  |  A/D=上一张/下一张  |  空格=播放/暂停  |  黄框=当前预览）")
         gl = QVBoxLayout(grid_box)
         self.scroll = QScrollArea()
         self.scroll.setWidgetResizable(True)
@@ -444,7 +469,7 @@ class FrameSelectorPage(QWidget):
         cols = max(1, avail // cell_w) if avail > 0 else 4
         for item in self.frames:
             cell = ThumbCell(item.index, item.filepath, thumb_w, thumb_h)
-            cell.clicked.connect(self._toggle_cell)
+            cell.check_toggled.connect(self._on_cell_check)
             self.cells.append(cell)
             r, c = divmod(item.index, cols)
             self.grid.addWidget(cell, r, c)
@@ -471,10 +496,11 @@ class FrameSelectorPage(QWidget):
         if restore_idx >= 0 and restore_idx < len(self.cells):
             self._set_current_cell(restore_idx)
 
-    def _toggle_cell(self, index: int):
+    def _on_cell_check(self, index: int, checked: bool):
+        """左上角选择框勾选变化 → 更新选中状态"""
         if 0 <= index < len(self.frames):
-            self.frames[index].selected = not self.frames[index].selected
-            self.cells[index].set_selected(self.frames[index].selected)
+            self.frames[index].selected = checked
+            self.cells[index].set_selected(checked)
             self._update_count()
 
     def _set_all(self, value: bool):
@@ -608,6 +634,18 @@ class FrameSelectorPage(QWidget):
         if 0 <= idx < len(self.cells):
             self.cells[idx].set_current(True)
         self._current_cell_idx = idx
+
+    def _step_preview(self, delta: int):
+        """A/D：在全部帧中切换上一张/下一张预览（黄色高亮跟随）"""
+        n = len(self.frames)
+        if n == 0:
+            return
+        cur = self._current_cell_idx
+        if 0 <= cur < n:
+            idx = (cur + delta) % n
+        else:
+            idx = 0 if delta > 0 else n - 1
+        self._preview_frame(idx)
 
     def _preview_frame(self, idx: int):
         """在预览区显示指定索引的帧（用于单击缩略图查看）"""

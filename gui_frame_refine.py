@@ -32,7 +32,7 @@ from PySide6.QtWidgets import (
 )
 
 from gui_frame_matting import (
-    imread_unicode, imwrite_unicode, _checker_tile,
+    imread_unicode, imwrite_unicode, _checker_tile, frame_no_from_name,
 )
 
 
@@ -257,7 +257,8 @@ class RefineCanvas(QWidget):
             t = self._transform()
             if t is not None:
                 s, ox, oy, _ = t
-                radius = max(1.0, self.page.brush_size() * s)
+                # 笔刷值=直径（图像像素），提示圈半径要与实际擦除区域一致
+                radius = max(1.0, self.page.brush_size() * 0.5 * s)
                 cx = self._hover.x() * s + ox
                 cy = self._hover.y() * s + oy
                 color = self.TOOL_COLORS.get(self.page.tool(), QColor("white"))
@@ -768,7 +769,7 @@ class FrameRefinePage(QWidget):
             refined_path = os.path.join(self.refined_dir, fn)
             orig_path = self._find_original(stem)
             self.items.append({
-                "key": fn, "number": i + 1,
+                "key": fn, "number": frame_no_from_name(fn, i + 1),
                 "matted": matted_path, "refined": refined_path,
                 "orig": orig_path,
             })
