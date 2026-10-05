@@ -469,10 +469,23 @@ class _BakeWorker(QThread):
                 if img is None:
                     raise IOError(f"读取失败 {src}")
                 sim = scale_bgra(img, pct / 100.0)
-                canvas = np.zeros((ch, cw, 4), np.uint8)
+                # 亚像素平移：先按原尺寸定整数原点，再按小数部分
+                # warpAffine 偏移（扩1px防边缘裁切），最后走整数合成
                 x, y = centered_xy(cw, ch, sim.shape[1], sim.shape[0])
+                fx = ox - np.floor(ox)
+                fy = oy - np.floor(oy)
+                if fx > 1e-6 or fy > 1e-6:
+                    nw = sim.shape[1] + (1 if fx > 1e-6 else 0)
+                    nh = sim.shape[0] + (1 if fy > 1e-6 else 0)
+                    M = np.float32([[1, 0, fx], [0, 1, fy]])
+                    sim = cv2.warpAffine(
+                        sim, M, (nw, nh),
+                        flags=cv2.INTER_LINEAR,
+                        borderMode=cv2.BORDER_CONSTANT,
+                        borderValue=(0, 0, 0, 0))
+                canvas = np.zeros((ch, cw, 4), np.uint8)
                 flatten_over(canvas, sim,
-                             x + int(round(ox)), y + int(round(oy)))
+                             x + int(np.floor(ox)), y + int(np.floor(oy)))
                 tmp = dst + ".tmp.png"      # imencode 需要 .png 扩展名
                 if not imwrite_unicode(tmp, canvas):
                     raise IOError(f"写入失败 {dst}")
@@ -787,7 +800,7 @@ class FrameAdjustPage(QWidget):
 
         self._build_ui()
         QShortcut(QKeySequence("Ctrl+Z"), self, self._undo_selected)
-        # WASD 微调位置（1px/次），QE 调大小（步进用户可设，默认1%）
+        # WASD 微调位置（步进可设，默认1px），QE 调大小（步进可设，默认1%）
         QShortcut(QKeySequence(Qt.Key_W), self, context=Qt.WindowShortcut,
                   activated=lambda: self._key_nudge(0, -1))
         QShortcut(QKeySequence(Qt.Key_A), self, context=Qt.WindowShortcut,
@@ -875,7 +888,12 @@ class FrameAdjustPage(QWidget):
         self.btn_undo_sel.clicked.connect(self._undo_selected)
         self.btn_undo_sel.setEnabled(False)
         rowt.addWidget(self.btn_undo_sel)
-        rowt.addWidget(QLabel(" QE步进:"))
+        rowt.addStretch()
+        tf.addLayout(rowt)
+
+        # 键盘微调步进（独立一行，避免工具行过宽撑大右面板破坏左右占比）
+        rowk = QHBoxLayout()
+        rowk.addWidget(QLabel(" QE步进:"))
         self.key_step_spin = QDoubleSpinBox()
         self.key_step_spin.setRange(0.1, 10.0)
         self.key_step_spin.setSingleStep(0.1)
@@ -883,11 +901,21 @@ class FrameAdjustPage(QWidget):
         self.key_step_spin.setValue(1.0)
         self.key_step_spin.setSuffix("%")
         self.key_step_spin.setToolTip(
-            "Q/E 键每按一次的缩放变化量（0.1%~10%，默认1%）\n"
-            "W/A/S/D 键每按一次移动 1px（均作用于当前操作图/框选组）")
-        rowt.addWidget(self.key_step_spin)
-        rowt.addStretch()
-        tf.addLayout(rowt)
+            "Q/E 键每按一次的缩放变化量（0.1%~10%，默认1%）")
+        rowk.addWidget(self.key_step_spin)
+        rowk.addWidget(QLabel(" WASD步进:"))
+        self.move_step_spin = QDoubleSpinBox()
+        self.move_step_spin.setRange(0.5, 100.0)
+        self.move_step_spin.setSingleStep(0.5)
+        self.move_step_spin.setDecimals(1)
+        self.move_step_spin.setValue(1.0)
+        self.move_step_spin.setSuffix(" px")
+        self.move_step_spin.setToolTip(
+            "W/A/S/D 键每按一次的移动距离（0.5~100px，默认1px）\n"
+            "均作用于当前操作图/框选组")
+        rowk.addWidget(self.move_step_spin)
+        rowk.addStretch()
+        tf.addLayout(rowk)
 
         # 视图缩放（放大镜式，分辨率不变）
         rowz = QHBoxLayout()
@@ -1598,17 +1626,18 @@ class FrameAdjustPage(QWidget):
             self._render_workspace()
 
     def _key_nudge(self, dx: float, dy: float):
-        """WASD：当前图（或框选组）每次移动 1px，连按合并一个撤销点"""
+        """WASD：当前图（或框选组）按步进移动（默认1px，最小0.5px）"""
         keys = self._key_targets()
         if not keys:
             return
+        step = self.move_step_spin.value()
         now = time.monotonic()
         for k in keys:
             if now - self._undo_coalesce.get(k, 0.0) > 0.8:
                 self._push_undo(k)
             self._undo_coalesce[k] = now
             ox, oy = self._layer_offsets.get(k, (0.0, 0.0))
-            self._layer_offsets[k] = [ox + dx, oy + dy]
+            self._layer_offsets[k] = [ox + dx * step, oy + dy * step]
             self._dirty.add(k)
         self._begin_key_drag(keys)
         self._render_workspace()
