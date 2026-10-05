@@ -11,8 +11,8 @@
 alpha 通道原样保留。输入优先取精抠结果（refined/），无则取批量抠图
 （matted/）；输出到 frames_dir/colored/ 同名 PNG。
 
-布局与其它页面一致：左右固定 13:8。左侧上下两部分——
-上=待矫色的抠图（棋盘格透明底），下=基板原图（颜色参考）；
+布局与其它页面一致：左右固定 13:8。左侧左右两部分——
+左=基板原图（颜色参考），右=待矫色的抠图（棋盘格透明底）；
 右侧上面功能按钮，下面全部图片缩略图网格。
 """
 
@@ -373,22 +373,22 @@ class FrameColorPage(QWidget):
         root.setSpacing(8)
 
         # ===== 左侧：左右两个显示区 =====
-        left_box = QGroupBox("矫色预览（左：抠好的图片 / 右：颜色参考基板原图）")
+        left_box = QGroupBox("矫色预览（左：颜色参考基板原图 / 右：抠好的图片）")
         lv = QVBoxLayout(left_box)
         splitter = QSplitter(Qt.Horizontal)
         splitter.setStyleSheet("QSplitter{background:#2b2b2b;}")
-
-        top_group = QGroupBox("抠好的图片（矫色对象，棋盘格=透明）")
-        tv = QVBoxLayout(top_group)
-        self.view_label = FitImageLabel(checker=True)
-        tv.addWidget(self.view_label)
-        splitter.addWidget(top_group)
 
         bottom_group = QGroupBox("颜色参考图（基板原图）")
         bv = QVBoxLayout(bottom_group)
         self.board_label = FitImageLabel(checker=False)
         bv.addWidget(self.board_label)
         splitter.addWidget(bottom_group)
+
+        top_group = QGroupBox("抠好的图片（矫色对象，棋盘格=透明）")
+        tv = QVBoxLayout(top_group)
+        self.view_label = FitImageLabel(checker=True)
+        tv.addWidget(self.view_label)
+        splitter.addWidget(top_group)
         splitter.setSizes([400, 400])
         lv.addWidget(splitter)
 
