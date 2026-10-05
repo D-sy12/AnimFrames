@@ -406,6 +406,14 @@ class FrameSelectorPage(QWidget):
             self._load_frames(d)
 
     def _load_frames(self, directory: str):
+        # 加载期间暂停落盘，避免读到旧勾选前先用空选择覆盖 json
+        self._suspend_persist = True
+        try:
+            self._load_frames_impl(directory)
+        finally:
+            self._suspend_persist = False
+
+    def _load_frames_impl(self, directory: str):
         self.frames_dir = directory
         self._frames_sig = self._frames_signature(directory)
         # 手动加载的目录也同步给后续模块（抠图/色调/导出）
@@ -546,6 +554,28 @@ class FrameSelectorPage(QWidget):
         sel_frames = [f for f in self.frames if f.selected]
         self.shared_state["selected_indices"] = [f.index for f in sel_frames]
         self.shared_state["selected_files"] = [f.filename for f in sel_frames]
+        self._persist_selection()
+
+    def _persist_selection(self):
+        """勾选变化实时落盘 selected_frames.json，程序重启后可恢复"""
+        if getattr(self, "_suspend_persist", False) or not self.frames_dir:
+            return
+        sel_frames = [f for f in self.frames if f.selected]
+        out = {
+            "frames_dir": os.path.abspath(self.frames_dir),
+            "total_frames": len(self.frames),
+            "selected_count": len(sel_frames),
+            "selected_indices": [f.index for f in sel_frames],
+            "selected_files": [f.filename for f in sel_frames],
+            "selected_original_indices": [f.original_index for f in sel_frames],
+            "selected_timestamps_ms": [f.timestamp_ms for f in sel_frames],
+        }
+        try:
+            with open(os.path.join(self.frames_dir, "selected_frames.json"),
+                      "w", encoding="utf-8") as fp:
+                json.dump(out, fp, ensure_ascii=False, indent=2)
+        except OSError:
+            pass
 
     def _selected_frames(self) -> List[FrameItem]:
         return [f for f in self.frames if f.selected]
