@@ -372,9 +372,14 @@ class FrameSelectorPage(QWidget):
 
         rlay.addWidget(func_box, 0)
 
-        # 帧选择网格
-        grid_box = QGroupBox("所有帧（左上角勾选=选中  |  单击=预览  |  A/D=上一张/下一张  |  Q/E=选中/取消选中  |  空格=播放/暂停  |  黄框=当前预览）")
+        # 帧选择网格（标题保持短：长标题会撑大右栏最小宽度，窗口模式被裁切）
+        grid_box = QGroupBox("所有帧")
         gl = QVBoxLayout(grid_box)
+        tip = QLabel("左上角勾选=选中  |  单击=预览  |  A/D=上一张/下一张  |  "
+                     "Q/E=选中/取消选中  |  空格=播放/暂停  |  黄框=当前预览")
+        tip.setWordWrap(True)
+        tip.setStyleSheet("color:#888; font-size:11px;")
+        gl.addWidget(tip)
         self.scroll = QScrollArea()
         self.scroll.setWidgetResizable(True)
         self.scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
