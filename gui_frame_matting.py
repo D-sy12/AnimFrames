@@ -18,6 +18,7 @@
 """
 
 import os
+import re
 import json
 import traceback
 from typing import Dict, List, Optional, Tuple
@@ -36,6 +37,15 @@ from PySide6.QtWidgets import (
 
 
 # ===================== 工具函数 =====================
+
+def frame_no_from_name(filename: str, fallback: int) -> int:
+    """从帧文件名解析原始帧号（frame_00005.png → 5），解析失败用 fallback。
+
+    下游页面（精抠/色调统一等）用它在缩略图下显示与视频导帧一致的编号，
+    不再按列表位置重新从 1 开始编号。"""
+    nums = re.findall(r"\d+", os.path.splitext(filename)[0])
+    return int(nums[-1]) if nums else fallback
+
 
 def imread_unicode(path: str) -> Optional[np.ndarray]:
     """支持中文路径的图片读取"""
@@ -784,22 +794,14 @@ class FrameMattingPage(QWidget):
         view_row.addStretch()
         nv.addLayout(view_row)
 
-        # 残留背景色检测
+        # 半透明像素高亮
         res_row = QHBoxLayout()
         self.chk_residue = QCheckBox("🔍 残留高亮")
         self.chk_residue.setToolTip(
-            "把抠图结果中仍然不透明、但颜色接近背景色的像素\n"
-            "用品红色标记出来，方便检查有没有抠干净")
+            "勾选后，抠图结果中所有半透明像素（0<alpha<255）\n"
+            "都用洋红色标记出来，方便定位没抠干净的边缘/杂点")
         res_row.addWidget(self.chk_residue)
-        res_row.addWidget(QLabel("判定:"))
-        self.residue_slider = QSlider(Qt.Horizontal)
-        self.residue_slider.setRange(10, 120)
-        self.residue_slider.setValue(45)
-        self.residue_slider.setToolTip("与背景色的颜色距离小于该值即判为可疑残留")
-        self.residue_label = QLabel("45")
-        self.residue_label.setMinimumWidth(26)
-        res_row.addWidget(self.residue_slider, 1)
-        res_row.addWidget(self.residue_label)
+        res_row.addStretch()
         nv.addLayout(res_row)
         self.residue_info = QLabel("")
         self.residue_info.setStyleSheet("color:#e056fd; font-size:11px;")
@@ -843,11 +845,8 @@ class FrameMattingPage(QWidget):
             _s.valueChanged.connect(self._schedule_preview)
         self.chk_protect_inner.toggled.connect(self._schedule_preview)
 
-        # 残留高亮开关 / 判定阈值 → 刷新结果显示
+        # 残留高亮开关 → 刷新结果显示
         self.chk_residue.toggled.connect(self._on_residue_changed)
-        self.residue_slider.valueChanged.connect(
-            lambda v: self.residue_label.setText(str(v)))
-        self.residue_slider.valueChanged.connect(self._on_residue_changed)
 
     # ---------- 加载 ----------
 
@@ -1005,24 +1004,18 @@ class FrameMattingPage(QWidget):
         return arr
 
     def _overlay_residue(self, bgra: np.ndarray) -> np.ndarray:
-        """找出不透明但颜色接近任一背景色的可疑像素，用品红标记"""
-        thr = float(self.residue_slider.value())
-        bgr = bgra[:, :, :3].astype(np.int16)
-        dmin = None
-        for r, g, b in self._bg_colors:
-            d = np.linalg.norm(bgr - np.array([b, g, r], np.int16), axis=2)
-            dmin = d if dmin is None else np.minimum(dmin, d)
-        visible = bgra[:, :, 3] >= 128       # 只检查基本不透明的像素
-        mask = (dmin < thr) & visible
+        """所有半透明像素（0<alpha<255）用洋红标记，定位没抠干净的位置"""
+        a = bgra[:, :, 3]
+        mask = (a > 0) & (a < 255)
         n_res = int(mask.sum())
-        # 轻微膨胀，让单个残留点也肉眼可见
+        # 轻微膨胀，让单个半透明点也肉眼可见
         mark = cv2.dilate(mask.astype(np.uint8),
                           np.ones((3, 3), np.uint8), iterations=1).astype(bool)
         out = bgra.copy()
-        out[mark] = (255, 0, 255, 255)       # 品红 BGR
-        n_vis = max(1, int(visible.sum()))
+        out[mark] = (255, 0, 255, 255)       # 洋红 BGR
+        total = max(1, a.size)
         self.residue_info.setText(
-            f"品红=可疑残留 {n_res} 像素（占不透明区域 {n_res / n_vis * 100:.2f}%）")
+            f"洋红=半透明像素 {n_res} 个（占全图 {n_res / total * 100:.2f}%）")
         return out
 
     def _show_bgra(self, bgra: np.ndarray):
@@ -1038,13 +1031,10 @@ class FrameMattingPage(QWidget):
     def _render_saved_result(self, path: str):
         """渲染已落盘的抠图结果（可选残留高亮叠加）"""
         if self.chk_residue.isChecked():
-            if not self._bg_colors:
-                self.residue_info.setText("请先在背景色列表中添加要检查的颜色")
-            else:
-                bgra = self._ensure_bgra(imread_unicode(path))
-                if bgra is not None:
-                    self._show_bgra(self._overlay_residue(bgra))
-                    return
+            bgra = self._ensure_bgra(imread_unicode(path))
+            if bgra is not None:
+                self._show_bgra(self._overlay_residue(bgra))
+                return
         else:
             self.residue_info.setText("")
         pix = QPixmap(path)
@@ -1097,12 +1087,10 @@ class FrameMattingPage(QWidget):
         # 2) 静态已保存结果（rembg 结果等）
         src = self.results.get(self.cur_index)
         if src is not None:
-            if overlay_on and self._bg_colors:
+            if overlay_on:
                 bgra = self._ensure_bgra(imread_unicode(src))
                 if bgra is not None:
                     self._show_bgra(self._overlay_residue(bgra))
-            elif overlay_on:
-                self.residue_info.setText("请先在背景色列表中添加要检查的颜色")
             else:
                 # 关闭高亮：恢复普通结果显示并清空统计
                 self._render_saved_result(src)

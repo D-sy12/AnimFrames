@@ -34,6 +34,7 @@ from PySide6.QtWidgets import (
 
 from gui_frame_matting import (
     imread_unicode, imwrite_unicode, compose_checkerboard,
+    frame_no_from_name,
 )
 
 
@@ -594,7 +595,7 @@ class FrameColorPage(QWidget):
             colored_path = os.path.join(self.colored_dir, fn)
             orig = self._find_original(stem)
             self.items.append({
-                "key": fn, "number": i + 1,
+                "key": fn, "number": frame_no_from_name(fn, i + 1),
                 "matted": matted_path,
                 "refined": refined_path,
                 "colored": colored_path,

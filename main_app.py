@@ -8,7 +8,8 @@
   3. 批量抠图
   4. 图片精抠
   5. 色调统一
-  6. 导出图片（开发中）
+  6. 调整位置
+  7. 导出图片（开发中）
 
 运行：
     python main_app.py11
@@ -27,6 +28,7 @@ from gui_frame_selector import FrameSelectorPage
 from gui_frame_matting import FrameMattingPage
 from gui_frame_refine import FrameRefinePage
 from gui_frame_color import FrameColorPage
+from gui_frame_adjust import FrameAdjustPage
 
 
 # ===================== 占位页面（待开发模块） =====================
@@ -64,6 +66,7 @@ class MainApp(QMainWindow):
         ("matting",   "批量抠图"),
         ("refine",    "图片精抠"),
         ("color",     "色调统一"),
+        ("adjust",    "调整位置"),
         ("export",    "导出图片"),
     ]
 
@@ -141,7 +144,11 @@ class MainApp(QMainWindow):
         self.page_color = FrameColorPage(self.shared_state)
         self.stack.addWidget(self.page_color)
 
-        # 页面 6：导出图片
+        # 页面 6：调整位置
+        self.page_adjust = FrameAdjustPage(self.shared_state)
+        self.stack.addWidget(self.page_adjust)
+
+        # 页面 7：导出图片
         self.page_export = PlaceholderPage(
             "导出图片",
             "拼图 / 动画预览 / 分辨率调整 / 导出 PNG 序列或雪碧图")
