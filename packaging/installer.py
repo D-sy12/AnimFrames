@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""
+r"""
 动画序列帧制作工具 - 安装程序
 
 单文件安装向导（PyInstaller onefile，程序文件内嵌于 payload/AnimFrames）：
@@ -29,9 +29,9 @@ VERSION = "0.24"
 def payload_dir() -> str:
     base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
     p = os.path.join(base, "payload", APP_ID)
-    if not os.path.isdir(p):   # 开发调试：直接用打包产物目录
-        p = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                         "dist", APP_ID)
+    if not os.path.isdir(p):   # 开发调试：直接用打包产物目录（dist 在工程根目录）
+        p = os.path.normpath(os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), "..", "dist", APP_ID))
     return p
 
 

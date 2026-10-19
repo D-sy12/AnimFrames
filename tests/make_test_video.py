@@ -1,5 +1,7 @@
 # -*- coding: utf-8 -*-
 """生成测试视频：包含静止帧和变化帧，用于验证抽帧与去重功能"""
+import os
+
 import cv2
 import numpy as np
 
@@ -7,8 +9,9 @@ W, H = 320, 240
 FPS = 10
 TOTAL = 60  # 6秒
 
+OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "test_video.mp4")
 fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-out = cv2.VideoWriter("test_video.mp4", fourcc, FPS, (W, H))
+out = cv2.VideoWriter(OUT, fourcc, FPS, (W, H))
 
 for i in range(TOTAL):
     frame = np.zeros((H, W, 3), dtype=np.uint8)
@@ -30,4 +33,4 @@ for i in range(TOTAL):
     out.write(frame)
 
 out.release()
-print("测试视频已生成: test_video.mp4 (6秒, 10fps, 60帧)")
+print(f"测试视频已生成: {OUT} (6秒, 10fps, 60帧)")

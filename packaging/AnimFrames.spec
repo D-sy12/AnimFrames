@@ -1,7 +1,12 @@
 # -*- mode: python ; coding: utf-8 -*-
+import os
 from PyInstaller.utils.hooks import collect_all
 
-datas = [('app_icon.ico', '.')]
+# spec 已移入 packaging/ 子目录：以 spec 所在目录为基准，工程根目录是它的上一级
+ROOT = os.path.dirname(SPECPATH)
+ICON = os.path.join(ROOT, 'app_icon.ico')
+
+datas = [(ICON, '.')]
 binaries = []
 hiddenimports = []
 tmp_ret = collect_all('rembg')
@@ -11,8 +16,8 @@ datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 
 
 a = Analysis(
-    ['main_app.py'],
-    pathex=[],
+    [os.path.join(ROOT, 'main_app.py')],
+    pathex=[ROOT],
     binaries=binaries,
     datas=datas,
     hiddenimports=hiddenimports,
@@ -41,7 +46,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=['app_icon.ico'],
+    icon=[ICON],
 )
 coll = COLLECT(
     exe,

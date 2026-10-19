@@ -1,9 +1,13 @@
 # -*- mode: python ; coding: utf-8 -*-
+import os
+
+# spec 已移入 packaging/ 子目录：以 spec 所在目录为基准，工程根目录是它的上一级
+ROOT = os.path.dirname(SPECPATH)
 
 
 a = Analysis(
-    ['main_app.py'],
-    pathex=[],
+    [os.path.join(ROOT, 'main_app.py')],
+    pathex=[ROOT],
     binaries=[],
     datas=[],
     hiddenimports=[],
